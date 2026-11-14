@@ -1025,13 +1025,26 @@ mod tests {
     #[tokio::test]
     async fn shutdown_cancels_long_poll_readers_before_taking_session_locks() {
         timeout(Duration::from_secs(2), async {
+            // Complete reservation release explicitly. An unused UDP port can
+            // silently drop packets when the host rate-limits ICMP errors.
+            let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = udp.local_addr().unwrap().port();
+            let release = tokio::spawn(async move {
+                let mut packet = [0; 1024];
+                let (n, peer) = udp.recv_from(&mut packet).await.unwrap();
+                assert!(packet[..n].windows(10).any(|word| word == b"DISCONNECT"));
+                udp.send_to(b"\x00\x01\x00\x00\x00\x00\x00\x03OK\x00", peer).await.unwrap();
+                let (_, commit_peer) = udp.recv_from(&mut packet).await.unwrap();
+                assert_eq!(commit_peer, peer);
+                udp.send_to(b"\x00\x03\x00\x00\x00\x00\x00\x00", peer).await.unwrap();
+            });
             let (tunnel, mut hardware) = stream_pair().await;
-            let session = Arc::new(SilexSession::new("127.0.0.1", [0; 6], "usb5-005:0", None, 19540, Duration::ZERO));
+            let session = Arc::new(SilexSession::new("127.0.0.1", [0; 6], "usb5-005:0", None, port, Duration::ZERO));
             session.use_test_stream(tunnel).await;
             let config = [9, 4, 0, 0, 1, 0xFF, 0, 3, 0, 7, 5, 0x84, 2, 0, 4, 0];
             let device = Arc::new(SilexDevice::build(session, &config, "usb5-005:0", |_| panic!("only one interface")).await.unwrap());
             let exporter = UsbipServer::new("127.0.0.1", [0; 6], None,
-                ("127.0.0.1".into(), 0), 19540, vec![]);
+                ("127.0.0.1".into(), 0), port, vec![]);
             exporter.active.lock().await.push(device.clone());
             let (mut client, server) = stream_pair().await;
             let pump = tokio::spawn(urb_pump_with_shutdown(server, device, exporter.stopping.subscribe()));
@@ -1041,6 +1054,7 @@ mod tests {
             // No reply or EOF: recv_response holds the read lock indefinitely.
             exporter.shutdown().await;
             pump.await.unwrap().unwrap();
+            release.await.unwrap();
         }).await.expect("shutdown waited on a long-poll session lock");
     }
 

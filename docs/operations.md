@@ -11,7 +11,7 @@ or install the Python client separately in a virtual environment.
 ## Install
 
 ```sh
-sudo apt install ./dist/release/opensilexlink_1.1.2_amd64.deb
+sudo apt install ./dist/release/opensilexlink_1.1.3_amd64.deb
 sudo usermod -aG opensilexlink "$USER"
 # Log out and back in to activate the new group, then:
 osl-gui
@@ -261,7 +261,7 @@ use a trusted LAN, with firewall isolation from untrusted networks.
 
 ## Release checks
 
-`packaging/build-packages.sh 1.1.2` runs Rust and Python tests, builds a locked
+`packaging/build-packages.sh 1.1.3` runs Rust and Python tests, builds a locked
 release binary, compiles translations, and produces Debian/RPM artifacts plus
 SHA256SUMS. Install cargo, pytest, PySide6 (for GUI tests), and nfpm 2.45.0.
 GUI tests run with Qt's offscreen platform. CI also tests installation in clean

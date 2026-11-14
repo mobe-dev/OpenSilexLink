@@ -19,7 +19,7 @@ The paths below assume a local build; for a downloaded package, pass its actual
 location to your package manager.
 
 ```sh
-sudo apt install ./dist/release/opensilexlink_1.1.2_amd64.deb
+sudo apt install ./dist/release/opensilexlink_1.1.3_amd64.deb
 sudo usermod -aG opensilexlink "$USER"
 # Log out and back in, or activate the group for this launch:
 sg opensilexlink -c osl-gui
@@ -89,7 +89,7 @@ Requires Rust/Cargo 1.93.1, Python 3 with pytest/PySide6, and nfpm 2.45.0 for pa
 ```sh
 cargo test --locked --manifest-path daemon/Cargo.toml
 QT_QPA_PLATFORM=offscreen python3 -m pytest -q client/tests
-packaging/build-packages.sh 1.1.2 dist/release
+packaging/build-packages.sh 1.1.3 dist/release
 ```
 
 The build produces `.deb`, `.rpm`, and `SHA256SUMS` in `dist/release/`. Installation is tested on the Ubuntu target host and in Debian 13 / Fedora 45

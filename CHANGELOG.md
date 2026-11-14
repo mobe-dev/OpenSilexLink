@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.1.2 (2026-11-14)
+## 1.1.3 (2026-11-14)
 
 - Bound USB/IP and module commands, terminate their process groups on timeout,
   and keep recovery detach and shutdown checks off Tokio workers so IPC remains responsive.
@@ -8,6 +8,9 @@
   detach ownership and clean up partial imports before retrying, with storage checks.
 - Cancel USB/IP pumps during shutdown and tunnel failure, including readers
   waiting for partial requests, before releasing session locks.
+
+Version 1.1.2 was tagged but not published after CI caught a shutdown test
+fixture relying on host UDP error responses. The test now uses a local responder.
 
 ## 1.1.1
 
