@@ -20,7 +20,7 @@ use anyhow::{bail, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::sync::{mpsc, watch, Mutex, Notify};
 use tokio::time::timeout;
 
 use super::device::SilexDevice;
@@ -54,6 +54,8 @@ pub struct UsbipServer {
     device_port: u16,
     devices: StdMutex<Vec<DeviceSlot>>,
     active: Arc<Mutex<Vec<Arc<SilexDevice>>>>,
+    imports: StdMutex<HashMap<String, Arc<AtomicBool>>>,
+    stopping: watch::Sender<bool>,
     listener: Mutex<Option<TcpListener>>,
     usb_password: Option<Vec<u8>>,
     device_passwords: StdMutex<HashMap<String, Vec<u8>>>,
@@ -89,6 +91,8 @@ impl UsbipServer {
             device_port,
             devices: StdMutex::new(devices),
             active: Arc::new(Mutex::new(Vec::new())),
+            imports: StdMutex::new(HashMap::new()),
+            stopping: watch::channel(false).0,
             listener: Mutex::new(None),
             usb_password: None,
             device_passwords: StdMutex::new(HashMap::new()),
@@ -179,8 +183,21 @@ impl UsbipServer {
         self.devices.lock().unwrap().iter().find(|d| d.busid == busid).cloned()
     }
 
-    /// Disconnect all active devices cleanly (against stuck reservations).
+    /// Imports whose URB pumps ended, even if VHCI has not released their ports.
+    pub fn failed_busids(&self) -> HashSet<String> {
+        self.imports.lock().unwrap().iter()
+            .filter(|(_, alive)| !alive.load(Ordering::SeqCst))
+            .map(|(busid, _)| busid.clone()).collect()
+    }
+
+    #[cfg(test)]
+    pub fn fail_test_import(&self, busid: &str) {
+        self.imports.lock().unwrap().insert(busid.into(), Arc::new(AtomicBool::new(false)));
+    }
+
+    /// Cancel pumps before acquiring session locks held by long-poll readers.
     pub async fn shutdown(&self) {
+        self.stopping.send_replace(true);
         let devices = { self.active.lock().await.clone() };
         for dev in devices {
             dev.disconnect_all().await;
@@ -206,6 +223,7 @@ impl UsbipServer {
     }
 
     async fn handle(self: Arc<Self>, mut conn: TcpStream) -> Result<()> {
+        if *self.stopping.borrow() { bail!("USB/IP exporter is shutting down"); }
         // Small interrupt/control completions (mouse and cursor updates) must
         // not wait behind Nagle's algorithm while bulk framebuffer traffic is idle.
         conn.set_nodelay(true)?;
@@ -334,6 +352,10 @@ impl UsbipServer {
             }
         };
         self.active.lock().await.push(device.clone());
+        // Each import has its own flag: an old handler finishing late must not
+        // mark a replacement import as dead.
+        let alive = Arc::new(AtomicBool::new(true));
+        self.imports.lock().unwrap().insert(busid, alive.clone());
         // Start keepalive on every connection; the pump stops it for iso/mux connections
         // (which keepalive themselves) and leaves it running on plain connections.
         for s in device.sessions() {
@@ -341,9 +363,12 @@ impl UsbipServer {
         }
         let result = async {
             conn.write_all(&up::build_rep_import(Some(&dev))).await?;
-            urb_pump(conn, device.clone()).await
+            urb_pump_with_shutdown(conn, device.clone(), self.stopping.subscribe()).await
         }
         .await;
+        // Publish the failure before reservation cleanup, which may wait on I/O.
+        // VHCI can still report USED after the underlying tunnel has ended.
+        alive.store(false, Ordering::SeqCst);
         {
             let mut act = self.active.lock().await;
             act.retain(|d| !Arc::ptr_eq(d, &device));
@@ -428,8 +453,10 @@ impl Pump {
             status: EPIPE,
             ..Default::default()
         };
-        let _ = self.send(&ret.to_bytes()).await;
+        // Wake the reader before attempting a completion: a stalled kernel may
+        // not drain the response socket. Teardown must not depend on that write.
         self.close();
+        let _ = self.send(&ret.to_bytes()).await;
     }
 }
 
@@ -437,7 +464,13 @@ fn contains(set: &[Arc<SilexSession>], s: &Arc<SilexSession>) -> bool {
     set.iter().any(|x| Arc::ptr_eq(x, s))
 }
 
+#[cfg(test)]
 async fn urb_pump(conn: TcpStream, device: Arc<SilexDevice>) -> Result<()> {
+    let (_sender, receiver) = watch::channel(false);
+    urb_pump_with_shutdown(conn, device, receiver).await
+}
+
+async fn urb_pump_with_shutdown(conn: TcpStream, device: Arc<SilexDevice>, mut stopping: watch::Receiver<bool>) -> Result<()> {
     let (rd, wr) = conn.into_split();
     let pump = Arc::new(Pump {
         wr: Mutex::new(wr),
@@ -481,7 +514,15 @@ async fn urb_pump(conn: TcpStream, device: Arc<SilexDevice>) -> Result<()> {
         }
     }
 
-    reader_loop(rd, pump.clone(), device.clone(), senders).await;
+    // Cover the whole reader, including payload reads and full worker queues.
+    // A tunnel failure must also cancel a reader waiting anywhere inside it.
+    tokio::select! {
+        _ = reader_loop(rd, pump.clone(), device.clone(), senders) => {},
+        _ = pump.shutdown.notified() => {},
+        _ = async {
+            if !*stopping.borrow_and_update() { let _ = stopping.changed().await; }
+        } => {},
+    }
     // `senders` was moved into reader_loop and dropped there -> queue workers see their
     // channel close and exit. Abort any task still blocked on device I/O (mux long-poll)
     // and await it, so it releases the session read/write locks before disconnect_all.
@@ -502,14 +543,9 @@ async fn reader_loop(
     let mut active_configuration = device.active_configuration();
     loop {
         let mut head = [0u8; UsbipCmdSubmit::HEADER_SIZE];
-        tokio::select! {
-            res = rd.read_exact(&mut head) => {
-                if let Err(error) = res {
-                    tracing::debug!(%error, "USB/IP request stream ended");
-                    break;
-                }
-            }
-            _ = pump.shutdown.notified() => break,
+        if let Err(error) = rd.read_exact(&mut head).await {
+            tracing::debug!(%error, "USB/IP request stream ended");
+            break;
         }
         let command = match up::peek_command(&head) {
             Ok(c) => c,
@@ -977,10 +1013,35 @@ mod tests {
             client.read_exact(&mut data).await.unwrap();
             assert_eq!(&data[..4], &[1, 2, 3, 4]);
             assert_eq!(&data[12..16], &4u32.to_be_bytes());
-            // A real tunnel EOF must wake the USB/IP reader, even with no commands.
+            // A real tunnel EOF must also wake a reader waiting for a partial
+            // USB/IP payload, beyond the command-header select.
+            client.write_all(&bulk_submit(44, up::USBIP_DIR_OUT, 2)[..48]).await.unwrap();
+            tokio::task::yield_now().await;
             drop(hardware);
             pump.await.unwrap().unwrap();
         }).await.expect("iso cancellation blocked behind a pending capture");
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_long_poll_readers_before_taking_session_locks() {
+        timeout(Duration::from_secs(2), async {
+            let (tunnel, mut hardware) = stream_pair().await;
+            let session = Arc::new(SilexSession::new("127.0.0.1", [0; 6], "usb5-005:0", None, 19540, Duration::ZERO));
+            session.use_test_stream(tunnel).await;
+            let config = [9, 4, 0, 0, 1, 0xFF, 0, 3, 0, 7, 5, 0x84, 2, 0, 4, 0];
+            let device = Arc::new(SilexDevice::build(session, &config, "usb5-005:0", |_| panic!("only one interface")).await.unwrap());
+            let exporter = UsbipServer::new("127.0.0.1", [0; 6], None,
+                ("127.0.0.1".into(), 0), 19540, vec![]);
+            exporter.active.lock().await.push(device.clone());
+            let (mut client, server) = stream_pair().await;
+            let pump = tokio::spawn(urb_pump_with_shutdown(server, device, exporter.stopping.subscribe()));
+            client.write_all(&bulk_submit(1, up::USBIP_DIR_IN, 4)).await.unwrap();
+            let mut request = [0; 18];
+            hardware.read_exact(&mut request).await.unwrap();
+            // No reply or EOF: recv_response holds the read lock indefinitely.
+            exporter.shutdown().await;
+            pump.await.unwrap().unwrap();
+        }).await.expect("shutdown waited on a long-poll session lock");
     }
 
     #[tokio::test]

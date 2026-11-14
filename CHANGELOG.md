@@ -1,6 +1,15 @@
 # Changelog
 
-## 1.1.1 (unreleased)
+## 1.1.2 (2026-11-14)
+
+- Bound USB/IP and module commands, terminate their process groups on timeout,
+  and keep recovery detach and shutdown checks off Tokio workers so IPC remains responsive.
+- Recover ended exports even when VHCI still reports a used port. Retain failed
+  detach ownership and clean up partial imports before retrying, with storage checks.
+- Cancel USB/IP pumps during shutdown and tunnel failure, including readers
+  waiting for partial requests, before releasing session locks.
+
+## 1.1.1
 
 - Add separate saved connection passwords for the DS-600's USB 3.0 and USB 2.0
   physical connectors, with masked entry, replacement and forgetting in the UI.

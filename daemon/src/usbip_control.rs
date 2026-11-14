@@ -14,6 +14,7 @@ use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Result};
+use crate::command::{CommandRunner, COMMAND_TIMEOUT};
 
 pub const REMOTE: &str = "127.0.0.1";
 
@@ -24,6 +25,7 @@ pub const HELPER_PATH: &str = "/usr/libexec/silex-usbip-helper";
 
 /// Privileged usbip operations (injectable so the daemon is testable with a fake).
 pub trait UsbipOps: Send + Sync {
+    fn ensure_idle(&self) -> Result<()> { Ok(()) }
     fn ensure_module(&self) -> Result<()>;
     fn used_ports(&self) -> HashSet<i32>;
     fn attach(&self, busid: &str) -> Result<()>;
@@ -75,6 +77,7 @@ pub struct UsbipControl {
     escalation: String,
     remote: String,
     helper: Option<String>,
+    runner: CommandRunner,
 }
 
 impl UsbipControl {
@@ -83,6 +86,7 @@ impl UsbipControl {
             escalation: escalation.to_string(),
             remote: REMOTE.to_string(),
             helper: find_helper(),
+            runner: CommandRunner::default(),
         }
     }
 
@@ -110,7 +114,11 @@ impl UsbipControl {
 
     fn run_priv(&self, argv: &[&str]) -> Result<()> {
         let cmd = self.build_cmd(argv);
-        let out = Command::new(&cmd[0]).args(&cmd[1..]).output();
+        // Allow time for an interactive polkit prompt on desktop sessions.
+        let deadline = if self.escalation == "pkexec" {
+            std::time::Duration::from_secs(120)
+        } else { COMMAND_TIMEOUT };
+        let out = self.runner.run(Command::new(&cmd[0]).args(&cmd[1..]), deadline);
         match out {
             Ok(o) if o.status.success() => Ok(()),
             Ok(o) => {
@@ -123,6 +131,7 @@ impl UsbipControl {
 }
 
 impl UsbipOps for UsbipControl {
+    fn ensure_idle(&self) -> Result<()> { self.runner.ensure_idle() }
     fn ensure_detachable(&self, port: i32) -> Result<()> {
         let root = Path::new("/sys/devices/platform");
         let mut busid = None;
@@ -130,6 +139,9 @@ impl UsbipOps for UsbipControl {
             let entry = entry?;
             if !entry.file_name().to_string_lossy().starts_with("vhci_hcd.") { continue; }
             if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+                // An interrupted import may never have created a local USB
+                // device. There can be no mounted storage on that port yet.
+                if importing_without_device(&status, port) { return Ok(()); }
                 busid = busid.or_else(|| local_busid(&status, port));
             }
         }
@@ -200,6 +212,14 @@ fn local_busid(status: &str, port: i32) -> Option<String> {
     })
 }
 
+fn importing_without_device(status: &str, port: i32) -> bool {
+    status.lines().skip(1).any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.len() >= 7 && fields[1].parse::<i32>().ok() == Some(port)
+            && fields[2].parse::<u32>().ok() == Some(5) && fields[6] == "0-0"
+    })
+}
+
 /// Extract busy vhci ports from the output of `usbip port`.
 /// Lines look like: `Port 00: <Port in Use> ...`.
 #[cfg(test)]
@@ -242,6 +262,15 @@ mod tests {
     }
 
     #[test]
+    fn interrupted_import_without_a_usb_device_can_be_detached() {
+        let status = "hub port sta spd dev sockfd local_busid\nhs 0000 005 002 00010002 000003 0-0\nss 0008 006 005 00010003 000003 3-1\nhs 0001 004 000 00000000 000000 0-0\n";
+        assert!(importing_without_device(status, 0));
+        assert!(!importing_without_device(status, 8));
+        assert!(!importing_without_device(status, 1));
+        assert!(!importing_without_device(status, 42));
+    }
+
+    #[test]
     fn vhci_status_includes_importing_ports_and_ignores_free_or_failed_ports() {
         let status = "hub port sta spd dev sockfd local_busid\nhs 0000 005 002 00010002 000003 0-0\nss 0008 006 005 00010003 000003 3-1\nhs 0001 004 000 00000000 000000 0-0\nhs 0002 007 000 00000000 000000 0-0\n";
         assert_eq!(parse_vhci_used_ports(status), HashSet::from([0, 8]));
@@ -263,7 +292,7 @@ Port 02: <Port in Use> at Full Speed(12Mbps)
 
     #[test]
     fn build_cmd_without_helper_uses_escalation() {
-        let ctl = UsbipControl { escalation: "sudo".into(), remote: REMOTE.into(), helper: None };
+        let ctl = UsbipControl { escalation: "sudo".into(), remote: REMOTE.into(), helper: None, runner: CommandRunner::default() };
         let cmd = ctl.build_cmd(&["usbip", "attach", "-r", "127.0.0.1", "-b", "1-1"]);
         assert_eq!(cmd[1], "-n");
         assert!(cmd[0].ends_with("sudo"));
@@ -272,7 +301,7 @@ Port 02: <Port in Use> at Full Speed(12Mbps)
 
     #[test]
     fn build_cmd_none_is_direct() {
-        let ctl = UsbipControl { escalation: "none".into(), remote: REMOTE.into(), helper: None };
+        let ctl = UsbipControl { escalation: "none".into(), remote: REMOTE.into(), helper: None, runner: CommandRunner::default() };
         let cmd = ctl.build_cmd(&["usbip", "detach", "-p", "0"]);
         assert!(cmd[0].ends_with("usbip"));
         assert_eq!(cmd.last().unwrap(), "0");
@@ -284,6 +313,7 @@ Port 02: <Port in Use> at Full Speed(12Mbps)
             escalation: "pkexec".into(),
             remote: REMOTE.into(),
             helper: Some("/usr/libexec/silex-usbip-helper".into()),
+            runner: CommandRunner::default(),
         };
         let cmd = ctl.build_cmd(&["usbip", "attach", "-r", "127.0.0.1", "-b", "1-2"]);
         assert!(cmd[0].ends_with("pkexec"));

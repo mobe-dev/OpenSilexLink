@@ -8,6 +8,7 @@
 //! subcommands are bring-up helpers for checking the tunnel against real hardware.
 
 mod daemon;
+mod command;
 mod credentials;
 mod discovery;
 mod ipc;

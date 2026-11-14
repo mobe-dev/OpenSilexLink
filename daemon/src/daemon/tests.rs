@@ -33,6 +33,8 @@ struct FakeUsbip {
     next: Mutex<i32>,
     calls: Mutex<Vec<String>>,
     mounted: AtomicBool,
+    fail_attach: AtomicBool,
+    fail_detach: AtomicBool,
 }
 
 impl UsbipOps for FakeUsbip {
@@ -52,10 +54,12 @@ impl UsbipOps for FakeUsbip {
         let mut n = self.next.lock().unwrap();
         *n += 1;
         self.attached.lock().unwrap().insert(busid.to_string(), *n);
+        if self.fail_attach.load(Ordering::Relaxed) { bail!("attach timed out after allocating a port"); }
         Ok(())
     }
     fn detach(&self, port: i32) -> Result<()> {
         self.calls.lock().unwrap().push(format!("detach {port}"));
+        if self.fail_detach.load(Ordering::Relaxed) { bail!("detach timed out"); }
         self.attached.lock().unwrap().retain(|_, v| *v != port);
         Ok(())
     }
@@ -220,7 +224,7 @@ async fn protected_device_recovers_with_its_physical_port_password_after_renumbe
     d.connect(MAC_STR, "usb4-007:0").await.unwrap();
     let port = d.connections.lock().unwrap()[&(MAC_STR.into(), "usb4-007:0".into())].port.unwrap();
     fake.detach(port).unwrap();
-    d.check_connections();
+    d.check_connections().await;
     srv.devices[0].dev_id = "usb4-012:0".into();
     d.apply_server(srv.clone(), true);
     tokio::time::timeout(Duration::from_secs(3), async {
@@ -308,9 +312,121 @@ async fn prune_phantoms_detaches_unplugged_device() {
     let mut gone = server();
     gone.devices.retain(|e| e.dev_id != "dev02");
     d.apply_server(gone, true);
-    d.prune_phantoms();
+    d.prune_phantoms().await;
     assert!(!d.connections.lock().unwrap().contains_key(&(MAC_STR.into(), "dev02".into())));
     assert!(fake.calls().iter().any(|c| c == "detach 1"));
+}
+
+#[tokio::test]
+async fn failed_phantom_detach_keeps_ownership_until_cleanup_succeeds() {
+    let (d, fake, _) = make();
+    d.apply_server(server(), true);
+    d.connect(MAC_STR, "dev01").await.unwrap();
+    let mut gone = server();
+    gone.devices.clear();
+    d.apply_server(gone, true);
+    fake.fail_detach.store(true, Ordering::Relaxed);
+    d.prune_phantoms().await;
+    assert_eq!(d.connections.lock().unwrap().len(), 1);
+    assert!(d.reconnecting.lock().unwrap().is_empty());
+    assert_eq!(fake.used_ports(), HashSet::from([1]));
+    fake.fail_detach.store(false, Ordering::Relaxed);
+    d.prune_phantoms().await;
+    assert!(d.connections.lock().unwrap().is_empty());
+    assert_eq!(d.reconnecting.lock().unwrap().len(), 1);
+    assert!(fake.used_ports().is_empty());
+    d.disconnect(MAC_STR, "dev01").await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_attach_is_cleaned_before_retry_and_retains_storage_checks() {
+    let (d, fake, _) = make();
+    d.apply_server(server(), true);
+    fake.fail_attach.store(true, Ordering::Relaxed);
+    assert!(d.connect(MAC_STR, "dev01").await.is_err());
+    assert_eq!(fake.used_ports(), HashSet::from([1]));
+    fake.fail_attach.store(false, Ordering::Relaxed);
+    fake.mounted.store(true, Ordering::Relaxed);
+    assert!(d.connect(MAC_STR, "dev01").await.unwrap_err().to_string().contains("Unmount"));
+    assert_eq!(fake.calls().iter().filter(|c| c.starts_with("attach")).count(), 1);
+    fake.mounted.store(false, Ordering::Relaxed);
+    d.connect(MAC_STR, "dev01").await.unwrap();
+    assert_eq!(fake.used_ports(), HashSet::from([2]));
+    assert!(fake.calls().iter().position(|c| c == "detach 1").unwrap()
+        < fake.calls().iter().rposition(|c| c.starts_with("attach")).unwrap());
+    d.shutdown().await;
+}
+
+#[tokio::test]
+async fn ended_export_is_recovered_even_while_vhci_still_reports_used() {
+    let (d, fake, _) = make();
+    d.apply_server(server(), true);
+    d.connect(MAC_STR, "dev01").await.unwrap();
+    let exporter = Arc::new(UsbipServer::new("127.0.0.1", MAC, None,
+        ("127.0.0.1".into(), 0), ud::PORT, vec![]));
+    exporter.fail_test_import("1-1");
+    *d.usbip_server.lock().unwrap() = Some(exporter);
+    assert_eq!(fake.used_ports(), HashSet::from([1]));
+    d.check_connections().await;
+    assert!(fake.used_ports().is_empty());
+    assert!(d.connections.lock().unwrap().is_empty());
+    assert_eq!(d.reconnecting.lock().unwrap().len(), 1);
+    d.disconnect(MAC_STR, "dev01").await.unwrap();
+}
+
+// A current-thread runtime makes worker starvation observable even on large hosts.
+#[tokio::test]
+async fn ipc_reads_remain_responsive_during_phantom_detach() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    struct SlowDetach {
+        fake: FakeUsbip,
+        started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+    impl UsbipOps for SlowDetach {
+        fn ensure_module(&self) -> Result<()> { Ok(()) }
+        fn used_ports(&self) -> HashSet<i32> { self.fake.used_ports() }
+        fn attach(&self, busid: &str) -> Result<()> { self.fake.attach(busid) }
+        fn detach(&self, port: i32) -> Result<()> {
+            if let Some(started) = self.started.lock().unwrap().take() { let _ = started.send(()); }
+            std::thread::sleep(Duration::from_millis(400));
+            self.fake.detach(port)
+        }
+    }
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let fake = Arc::new(SlowDetach { fake: FakeUsbip::default(), started: Mutex::new(Some(tx)) });
+    let d = Daemon::new(temp_store(), fake, false);
+    d.apply_server(server(), true);
+    d.connect(MAC_STR, "dev01").await.unwrap();
+    let ipc = d.attach_ipc(IpcAddr::Inet("127.0.0.1".into(), 0));
+    let server = tokio::spawn(ipc.clone().serve());
+    let port = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(port) = ipc.bound_port() { break port; }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }).await.unwrap();
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let (rd, mut wr) = stream.into_split();
+    let mut lines = BufReader::new(rd).lines();
+    let mut gone = self::server();
+    gone.devices.clear();
+    d.apply_server(gone, true);
+    let start = Instant::now();
+    let cleanup_daemon = d.clone();
+    let cleanup = tokio::spawn(async move { cleanup_daemon.prune_phantoms().await });
+    rx.await.unwrap();
+    wr.write_all(b"{\"id\":1,\"method\":\"get_settings\"}\n{\"id\":2,\"method\":\"list_servers\"}\n").await.unwrap();
+    for _ in 0..2 {
+        let line = tokio::time::timeout(Duration::from_millis(200), lines.next_line()).await.unwrap().unwrap().unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["ok"], true);
+    }
+    assert!(start.elapsed() < Duration::from_millis(300), "IPC was starved by detach");
+    assert!(!cleanup.is_finished());
+    cleanup.await.unwrap();
+    d.disconnect(MAC_STR, "dev01").await.unwrap();
+    server.abort();
+    let _ = server.await;
 }
 
 #[tokio::test]
@@ -321,7 +437,7 @@ async fn ds600_last_device_unplug_detaches_and_keeps_recovery_visible() {
     // Actual DS-600 empty-list response, through the UDP parser and daemon.
     let message = ud::parse(&hex::decode("000100000000000100").unwrap()).unwrap();
     d.on_disc_message("192.0.2.143".into(), message);
-    d.prune_phantoms();
+    d.prune_phantoms().await;
     assert_eq!(statuses(&d.servers_snapshot()).get("dev02").map(String::as_str), Some(STATUS_RECONNECTING));
     assert!(!d.connections.lock().unwrap().contains_key(&(MAC_STR.into(), "dev02".into())));
     assert!(fake.calls().iter().any(|c| c == "detach 1"));
@@ -601,7 +717,7 @@ async fn startup_connection_does_not_override_disabled_loss_recovery() {
     d.connect(MAC_STR, "dev01").await.unwrap();
     let port = d.connections.lock().unwrap()[&(MAC_STR.into(), "dev01".into())].port.unwrap();
     fake.detach(port).unwrap();
-    d.check_connections();
+    d.check_connections().await;
     d.maybe_autoconnect();
     tokio::time::sleep(Duration::from_millis(30)).await;
     assert!(d.connections.lock().unwrap().is_empty());
@@ -628,7 +744,7 @@ async fn recovery_tracks_changed_usb_address_without_detaching_the_other_device(
     let first = d.connections.lock().unwrap()[&(MAC_STR.into(), "dev01".into())].clone();
     let other = d.connections.lock().unwrap()[&(MAC_STR.into(), "dev02".into())].clone();
     fake.detach(first.port.unwrap()).unwrap();
-    d.check_connections();
+    d.check_connections().await;
     s.devices[0].dev_id = "dev03".into();
     d.apply_server(s, true);
     for _ in 0..150 {

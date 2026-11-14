@@ -16,6 +16,7 @@ use tokio::task::JoinHandle;
 
 use crate::discovery::{local_ip_towards, DeviceServer, DiscoveryListener};
 use crate::credentials::CredentialsStore;
+use crate::command::{CommandRunner, COMMAND_TIMEOUT};
 use crate::ipc::{Handler, IpcAddr, IpcServer, Peer};
 use crate::protocol::peer::{self as peerproto, PeerEndpoint, PeerMessage, PeerSender};
 use crate::protocol::udp_discovery as ud;
@@ -84,6 +85,7 @@ pub struct Daemon {
     our_ip: Mutex<HashMap<String, String>>,
     host_cache: Mutex<HashMap<String, String>>,
     connections: Mutex<HashMap<Key, Connection>>,
+    failed_attach_ports: Mutex<Option<HashSet<i32>>>, // occupancy before an uncertain attach
     busids: Mutex<HashMap<String, String>>,
     usbip_server: Mutex<Option<Arc<UsbipServer>>>,
     recently_released: Mutex<HashMap<Key, Instant>>,
@@ -138,6 +140,7 @@ impl Daemon {
             our_ip: Mutex::new(HashMap::new()),
             host_cache: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
+            failed_attach_ports: Mutex::new(None),
             busids: Mutex::new(HashMap::new()),
             usbip_server: Mutex::new(None),
             recently_released: Mutex::new(HashMap::new()),
@@ -215,6 +218,9 @@ impl Daemon {
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
         let _guard = self.connect_lock.lock().await;
+        if let Err(error) = self.cleanup_failed_attach().await {
+            tracing::error!(%error, "USB/IP failed-attach cleanup during shutdown failed");
+        }
         let connections: Vec<_> = self.connections.lock().unwrap().drain().map(|(_, c)| c).collect();
         for conn in connections {
             if let Some(port) = conn.port {
@@ -538,8 +544,8 @@ impl Daemon {
     async fn enable_system_service() -> Result<()> {
         if std::env::var_os("SILEX_SYSTEM_SERVICE").is_some() {
             tokio::task::spawn_blocking(|| -> Result<()> {
-                let output = std::process::Command::new("/usr/bin/systemctl")
-                    .args(["enable", "opensilexlink.service"]).output()?;
+                let output = CommandRunner::default().run(std::process::Command::new("/usr/bin/systemctl")
+                    .args(["enable", "opensilexlink.service"]), COMMAND_TIMEOUT)?;
                 if !output.status.success() {
                     bail!("Cannot enable connection before login: {}", String::from_utf8_lossy(&output.stderr).trim());
                 }
@@ -578,7 +584,10 @@ impl Daemon {
                 let _guard = self.connect_lock.lock().await;
                 let connections: Vec<_> = self.connections.lock().unwrap().values().cloned().collect();
                 for conn in connections {
-                    if let Some(port) = conn.port { self.usbip.ensure_detachable(port)?; }
+                    if let Some(port) = conn.port {
+                        let usbip = self.usbip.clone();
+                        tokio::task::spawn_blocking(move || usbip.ensure_detachable(port)).await??;
+                    }
                 }
                 Ok(json!({"ready": true}))
             }
@@ -782,10 +791,30 @@ impl Daemon {
         self.connect_inner(mac, dev_id, false).await
     }
 
+    /// Caller holds connect_lock. A failed attach can already have allocated a
+    /// port. Wait for its command to exit, then detach additions before retrying.
+    async fn cleanup_failed_attach(&self) -> Result<()> {
+        let before = self.failed_attach_ports.lock().unwrap().clone();
+        if let Some(before) = before {
+            let usbip = self.usbip.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                usbip.ensure_idle()?;
+                for port in usbip.used_ports().difference(&before).copied() {
+                    usbip.ensure_detachable(port)?;
+                    usbip.detach(port)?;
+                }
+                Ok(())
+            }).await??;
+            *self.failed_attach_ports.lock().unwrap() = None;
+        }
+        Ok(())
+    }
+
     async fn connect_inner(self: &Arc<Self>, mac: &str, dev_id: &str, automatic: bool) -> Result<Value> {
         self.cancel_grace_timer(mac, dev_id);
         let _guard = self.connect_lock.lock().await;
         if self.shutting_down.load(Ordering::SeqCst) { bail!("daemon is shutting down"); }
+        self.cleanup_failed_attach().await?;
         if automatic && self.manual_disconnects.lock().unwrap().contains(&(mac.to_string(), dev_id.to_string())) {
             bail!("automatic connection suppressed after manual disconnect");
         }
@@ -813,12 +842,17 @@ impl Daemon {
         // in its local queue and deadlock the entire attach.
         let usbip = self.usbip.clone();
         let attach_busid = busid.clone();
-        let before = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (before, attached) = tokio::task::spawn_blocking(move || -> Result<_> {
+            usbip.ensure_idle()?;
             usbip.ensure_module()?;
             let before = usbip.used_ports();
-            usbip.attach(&attach_busid)?;
-            Ok(before)
-        }).await?.map_err(|error| {
+            let attached = usbip.attach(&attach_busid);
+            Ok((before, attached))
+        }).await??;
+        if attached.is_err() {
+            *self.failed_attach_ports.lock().unwrap() = Some(before.clone());
+        }
+        attached.map_err(|error| {
             if device.primary().password_required() {
                 anyhow::anyhow!("Connection failed. Check the saved password for the {} physical port in USB port passwords. {error}",
                     if srv.usb_port(device.primary()) == Some("usb3") { "USB 3.0" } else { "USB 2.0" })
@@ -835,6 +869,10 @@ impl Daemon {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        if port.is_none() {
+            *self.failed_attach_ports.lock().unwrap() = Some(before);
+            bail!("USB/IP attach succeeded but its VHCI port could not be identified; cleanup required before retry");
         }
         let desc = srv
             .devices
@@ -910,8 +948,8 @@ impl Daemon {
             tokio::time::sleep(RECONNECT_CHECK_INTERVAL).await;
             // First prune unplugged devices (no reconnect for what is gone), then handle
             // lost tunnels.
-            self.prune_phantoms();
-            self.check_connections();
+            self.prune_phantoms().await;
+            self.check_connections().await;
         }
     }
 
@@ -929,38 +967,58 @@ impl Daemon {
     /// `check_connections`: there the vhci *port* vanishes (tunnel dead -> reconnect); here
     /// the device is absent from discovery. Detach the phantom port and queue
     /// recovery when enabled, so a physical replug is also recovered.
-    fn prune_phantoms(self: &Arc<Self>) {
+    async fn prune_phantoms(self: &Arc<Self>) {
         let conns: Vec<Connection> = self.connections.lock().unwrap().values().cloned().collect();
         for c in conns {
             if self.device_present(&c.server_mac, &c.dev_id) {
                 continue;
             }
-            self.handle_device_gone(c);
+            let _guard = self.connect_lock.lock().await;
+            if self.shutting_down.load(Ordering::SeqCst) { return; }
+            if self.device_present(&c.server_mac, &c.dev_id) { continue; }
+            self.handle_device_gone(c).await;
         }
     }
 
     /// A connected device vanished from discovery (unplugged): detach the phantom vhci
-    /// port, drop the connection, tell the GUI. No reconnect.
-    fn handle_device_gone(self: &Arc<Self>, conn: Connection) {
+    /// port, drop the connection, tell the GUI and queue recovery. Caller holds
+    /// connect_lock so detach cannot race port attribution or a replacement.
+    async fn handle_device_gone(self: &Arc<Self>, conn: Connection) {
         let key = (conn.server_mac.clone(), conn.dev_id.clone());
         {
-            let mut conns = self.connections.lock().unwrap();
+            let conns = self.connections.lock().unwrap();
             match conns.get(&key) {
                 Some(c) if c.port == conn.port => {}
                 _ => return, // disconnected/replaced meanwhile
             }
-            conns.remove(&key);
         }
         if let Some(port) = conn.port {
-            let _ = self.usbip.detach(port); // clean up the leftover vhci device
+            let usbip = self.usbip.clone();
+            let result = tokio::task::spawn_blocking(move || -> Result<()> {
+                usbip.ensure_detachable(port)?;
+                usbip.detach(port)
+            }).await;
+            if !matches!(result, Ok(Ok(()))) {
+                // Keep ownership and retry next pass; never reattach over a port
+                // whose detach failed or timed out.
+                tracing::warn!(port, busid = %conn.busid, ?result, "stale USB/IP detach failed; retaining attachment for retry");
+                return;
+            }
         }
+        self.connections.lock().unwrap().remove(&key);
         let desc = if conn.description.is_empty() { conn.dev_id.clone() } else { conn.description.clone() };
         self.broadcast_servers();
         self.notice(&conn.server_mac, &conn.dev_id, &desc, "removed", "device");
         self.queue_reconnect(conn);
     }
 
-    fn check_connections(self: &Arc<Self>) {
+    async fn check_connections(self: &Arc<Self>) {
+        let _guard = self.connect_lock.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst) { return; }
+        if let Err(error) = self.cleanup_failed_attach().await {
+            tracing::warn!(%error, "cannot clean up failed USB/IP attach yet");
+            return;
+        }
         let conns: Vec<Connection> = self
             .connections
             .lock()
@@ -972,11 +1030,23 @@ impl Daemon {
         if conns.is_empty() {
             return;
         }
-        let ports = self.usbip.used_ports();
+        let usbip = self.usbip.clone();
+        let ports = match tokio::task::spawn_blocking(move || usbip.used_ports()).await {
+            Ok(ports) => ports,
+            Err(error) => {
+                tracing::warn!(%error, "cannot inspect VHCI ports");
+                return;
+            }
+        };
+        let failed = self.usbip_server.lock().unwrap().as_ref()
+            .map(|s| s.failed_busids()).unwrap_or_default();
         for c in conns {
             if let Some(p) = c.port {
                 if !ports.contains(&p) {
                     self.handle_tunnel_lost(c);
+                } else if failed.contains(&c.busid) {
+                    tracing::warn!(port = p, busid = %c.busid, "tunnel ended but VHCI port remains occupied");
+                    self.handle_device_gone(c).await;
                 }
             }
         }

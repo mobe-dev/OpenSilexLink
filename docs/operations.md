@@ -11,7 +11,7 @@ or install the Python client separately in a virtual environment.
 ## Install
 
 ```sh
-sudo apt install ./dist/release/opensilexlink_1.1.1_amd64.deb
+sudo apt install ./dist/release/opensilexlink_1.1.2_amd64.deb
 sudo usermod -aG opensilexlink "$USER"
 # Log out and back in to activate the new group, then:
 osl-gui
@@ -162,6 +162,26 @@ Do not place irreplaceable writable storage on this transport without independen
 backups and application-level failure handling. Power loss/restart durability
 has not been certified by this project.
 
+Recovery commands have a 30-second deadline in service/headless mode. Desktop
+polkit commands allow 120 seconds including the administrator prompt. On timeout,
+the daemon signals the command's process group and returns an error without
+waiting indefinitely for it to exit. If the tracked child remains in kernel I/O,
+further commands are refused until it exits; IPC status requests continue to work.
+Logs include the command, PID and timeout or detach failure.
+
+Recovery also checks whether the local exporter ended, because an occupied VHCI
+port alone does not prove the remote tunnel is healthy. Stale attachments are
+detached before reconnecting. Failed detaches remain tracked for retry, and a
+failed attach's partially allocated ports are cleaned up before another attach.
+Automatic cleanup checks mounted storage and swap using the same visibility
+limits described above. Linux kernel I/O stuck in uninterruptible sleep can
+outlast the command deadline; a deadline cannot force the kernel to complete it.
+
+These changes address blocking paths found while investigating a reported DS-600
+reboot stall in 1.1.1. The original host incident has not been reproduced on
+hardware. Regression tests cover slow detach with responsive IPC, command
+timeouts, partial imports, stale occupied ports and shutdown with pending reads.
+
 ## Upgrade and remove
 
 Install a newer package with apt. Upgrades preserve settings and leave active
@@ -241,7 +261,7 @@ use a trusted LAN, with firewall isolation from untrusted networks.
 
 ## Release checks
 
-`packaging/build-packages.sh 1.1.1` runs Rust and Python tests, builds a locked
+`packaging/build-packages.sh 1.1.2` runs Rust and Python tests, builds a locked
 release binary, compiles translations, and produces Debian/RPM artifacts plus
 SHA256SUMS. Install cargo, pytest, PySide6 (for GUI tests), and nfpm 2.45.0.
 GUI tests run with Qt's offscreen platform. CI also tests installation in clean
