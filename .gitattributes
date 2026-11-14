@@ -1,7 +1,3 @@
-# Line endings normalized to LF in the repository and in every checkout,
-# whatever core.autocrlf says.
-* text=auto eol=lf
-
-# Binary files: never touch.
-*.png binary
-*.mo binary
+# Patch context and third-party legal texts must retain upstream whitespace.
+*.patch -whitespace
+LICENSES/* -whitespace
