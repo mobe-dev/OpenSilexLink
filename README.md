@@ -13,6 +13,11 @@ It is an independent project, unaffiliated with Silex Technology.
 
 Primary validated platform: **Ubuntu 26.04.1, x86-64** with systemd and vhci-hcd.
 
+Download the `.deb` or `.rpm` and `SHA256SUMS` from
+[GitHub Releases](https://github.com/mobe-dev/OpenSilexLink/releases/latest).
+The paths below assume a local build; for a downloaded package, pass its actual
+location to your package manager.
+
 ```sh
 sudo apt install ./dist/release/opensilexlink_1.1.0_amd64.deb
 sudo usermod -aG opensilexlink "$USER"
