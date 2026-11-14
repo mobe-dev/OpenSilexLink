@@ -31,6 +31,8 @@ jobs:
           python-version: "3.12"
       - name: Install build dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libopengl0
           python -m pip install pytest PySide6
           packaging/install-nfpm.sh
       - name: Build packages
