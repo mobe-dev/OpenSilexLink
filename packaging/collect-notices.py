@@ -51,4 +51,9 @@ output = root / "packaging/build/THIRD_PARTY_NOTICES.txt"
 output.parent.mkdir(parents=True, exist_ok=True)
 output.write_text("\n".join(sections))
 output.chmod(0o644)
+# Minimal Ubuntu images preserve copyright but discard other documentation.
+# Keep all legally required notices in that standard file as well.
+copyright_file = output.with_name("copyright")
+copyright_file.write_text((root / "LICENSE").read_text() + "\n\n" + output.read_text())
+copyright_file.chmod(0o644)
 print(f"Collected notices for {count} locked crates and Rust {rust_version}")

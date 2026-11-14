@@ -36,6 +36,10 @@ Rust distribution notice is from Ubuntu's `libstd-rust-1.93`, version
 `1.93.1+dfsg-0ubuntu6`; it conservatively includes toolchain components beyond
 the standard library linked into the daemon.
 
+Both packages also combine the original MIT license and all generated notices
+in `/usr/share/doc/opensilexlink/copyright`. This preserves the notices on minimal
+Ubuntu images that intentionally discard other documentation at install time.
+
 No firmware binary is in the tracked source. Firmware testing and reverse
 engineering were performed separately from the repository. The source review
 found no incorporated vendor SDK or decompiled vendor program in the application.

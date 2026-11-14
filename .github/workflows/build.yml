@@ -85,6 +85,7 @@ jobs:
           test -f /usr/share/polkit-1/actions/org.opensilexlink.policy
           test -f /usr/share/applications/opensilexlink.desktop
           test -f /usr/lib/systemd/system/opensilexlink.service
-          test -s /usr/share/doc/opensilexlink/THIRD_PARTY_NOTICES.txt
+          test -s /usr/share/doc/opensilexlink/copyright
+          grep -q 'unicode-ident' /usr/share/doc/opensilexlink/copyright
           getent group opensilexlink
           python3 -c "import sys; sys.path.insert(0, '/usr/lib/opensilexlink'); from PySide6 import QtWidgets; app = QtWidgets.QApplication([]); from opensilexlink.gui.app import MainWindow; print('GUI ok')"
