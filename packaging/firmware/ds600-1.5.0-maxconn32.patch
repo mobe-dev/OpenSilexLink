@@ -1,0 +1,20 @@
+--- a/etc/init.d/S90svu
++++ b/etc/init.d/S90svu
+@@ -4,7 +4,7 @@
+ SXSYSCONF=${DSDIR}/sbin/sxsysconf
+ 
+ # maximun number of USB interface connection
+-MAXCONN=15
++MAXCONN=32
+ 
+ DEV_ALLOW=/proc/sxuptp/devices.allow
+ DEV_DENY=/proc/sxuptp/devices.deny
+@@ -251,7 +251,7 @@
+ 		echo "${INSMOD} ${KMOD_DIR}/sxuptp.ko"
+ 		# load core modules
+ 		${INSMOD} ${KMOD_DIR}/sxuptp_wq.ko
+-		${INSMOD} ${KMOD_DIR}/sxuptp.ko
++		${INSMOD} ${KMOD_DIR}/sxuptp.ko maxconn=${MAXCONN}
+ 
+ 		# enable USB Device Filter
+ 		${INSMOD} ${KMOD_DIR}/sxuptp_devfilter.ko

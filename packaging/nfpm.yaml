@@ -2,7 +2,7 @@
 # formats; packaging/build-packages.sh runs the prerequisites (daemon release build,
 # compiled German catalog) and calls nfpm:
 #
-#   packaging/build-packages.sh 1.0.0
+#   packaging/build-packages.sh 1.1.0
 #
 # ${VERSION} is expanded from the environment (set by build-packages.sh).
 
@@ -12,42 +12,101 @@ platform: linux
 version: ${VERSION}
 section: net
 priority: optional
-maintainer: "bytewarrior <1134981+bytewarrior@users.noreply.github.com>"
+maintainer: "OpenSilexLink contributors"
 description: |
   Open-source Linux replacement for Silex SX Virtual Link.
   Bridges a Silex USB device server (USB-over-Ethernet) to the kernel's USB/IP
   stack: a userspace daemon speaks the Silex protocol, a PySide6 GUI drives it.
-  Tested against the Silex DS-510.
+  DS-600 storage and Bluetooth validated on Ubuntu 26.04.
 vendor: "OpenSilexLink (unofficial)"
-homepage: https://github.com/bytewarrior/OpenSilexLink
+homepage: https://github.com/mobe-dev/OpenSilexLink
 license: MIT
 
-# Only python3 is a hard dependency. Everything else is a Recommends, because the
-# package names differ between distributions (and some releases lack PySide6), and
-# a name mismatch should not block the installation:
-#   - PySide6 for the GUI (Debian/Ubuntu split it per Qt module),
-#   - usbip for the attach/detach tools,
-#   - pkexec/polkit for root-free attach/detach.
+# Desktop and USB/IP dependencies are required; packages install a working app.
 depends:
   - python3
 overrides:
   deb:
     depends:
       - python3 (>= 3.9)
-    recommends:
       - python3-pyside6.qtwidgets
-      - usbip
+      - usbip | linux-tools-generic
+      - kmod
+      - systemd
+      - passwd
+      - sudo
+      - libc6 (>= 2.39)
+    recommends:
       - pkexec
       - polkitd
   rpm:
     depends:
       - python3 >= 3.9
-    recommends:
       - python3-pyside6
       - usbip
+      - kmod
+      - systemd
+      - shadow-utils
+      - sudo
+      - glibc >= 2.39
+    recommends:
       - polkit
 
+scripts:
+  postinstall: ./packaging/scripts/postinstall.sh
+  preremove: ./packaging/scripts/preremove.sh
+  postremove: ./packaging/scripts/postremove.sh
+
 contents:
+  - src: ./packaging/needrestart/opensilexlink.conf
+    dst: /etc/needrestart/conf.d/opensilexlink.conf
+    type: config
+    file_info:
+      mode: 0644
+  - src: ./packaging/opensilexlink.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/opensilexlink.svg
+    file_info:
+      mode: 0644
+  - src: ./packaging/systemd/opensilexlink.service
+    dst: /usr/lib/systemd/system/opensilexlink.service
+    file_info:
+      mode: 0644
+  - src: ./packaging/systemd/silex-connect@.service
+    dst: /usr/lib/systemd/system/silex-connect@.service
+    file_info:
+      mode: 0644
+  - src: ./LICENSE
+    dst: /usr/share/doc/opensilexlink/copyright
+    file_info:
+      mode: 0644
+  - src: ./packaging/build/THIRD_PARTY_NOTICES.txt
+    dst: /usr/share/doc/opensilexlink/THIRD_PARTY_NOTICES.txt
+    file_info:
+      mode: 0644
+  - src: ./docs/licensing.md
+    dst: /usr/share/doc/opensilexlink/licensing.md
+    file_info:
+      mode: 0644
+  - src: ./docs/ds600-firmware.md
+    dst: /usr/share/doc/opensilexlink/ds600-firmware.md
+    file_info:
+      mode: 0644
+  - src: ./docs/ds600-recovery.md
+    dst: /usr/share/doc/opensilexlink/ds600-recovery.md
+    file_info:
+      mode: 0644
+  - src: ./docs/operations.md
+    dst: /usr/share/doc/opensilexlink/operations.md
+    file_info:
+      mode: 0644
+  - src: ./docs/ds600.md
+    dst: /usr/share/doc/opensilexlink/ds600.md
+    file_info:
+      mode: 0644
+  - src: ./docs/displaylink.md
+    dst: /usr/share/doc/opensilexlink/displaylink.md
+    file_info:
+      mode: 0644
   # Rust daemon binary.
   - src: ./daemon/target/release/silex-daemon
     dst: /usr/bin/silex-daemon
@@ -55,7 +114,7 @@ contents:
       mode: 0755
 
   # Python client (whole package tree, including the compiled .mo catalogs).
-  - src: ./client/src/opensilexlink
+  - src: ./packaging/build/client/opensilexlink
     dst: /usr/lib/opensilexlink/opensilexlink
     type: tree
 
@@ -70,6 +129,11 @@ contents:
       mode: 0755
 
   # Menu entry for the GUI.
+  - src: ./packaging/wrappers/opensilexlink-askpass
+    dst: /usr/libexec/opensilexlink-askpass
+    file_info:
+      mode: 0755
+
   - src: ./packaging/opensilexlink.desktop
     dst: /usr/share/applications/opensilexlink.desktop
     file_info:
@@ -81,12 +145,8 @@ contents:
     file_info:
       mode: 0755
 
-  # polkit policy + rule (password-free attach/detach for administrators).
+  # Authenticated development-mode helper policy.
   - src: ./packaging/polkit/org.opensilexlink.policy
     dst: /usr/share/polkit-1/actions/org.opensilexlink.policy
-    file_info:
-      mode: 0644
-  - src: ./packaging/polkit/49-opensilexlink.rules
-    dst: /usr/share/polkit-1/rules.d/49-opensilexlink.rules
     file_info:
       mode: 0644

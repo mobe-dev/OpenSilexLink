@@ -3,8 +3,10 @@
 This document describes the network protocol between a Silex USB device server
 and its client software, as implemented by OpenSilexLink. It was worked out from
 the network traffic between the vendor client (SX Virtual Link) and a **Silex
-DS-510**, for the sole purpose of interoperability. Other Silex models probably
-speak the same protocol, but only the DS-510 has been tested.
+DS-510**, for the sole purpose of interoperability. DS-600 discovery/control
+observations, firmware inspection and successful storage/Bluetooth operation
+have since established the DS-600 variant described below. See [DS-600
+validation status](ds600.md).
 
 All addresses and MACs in the examples are placeholders (`192.0.2.0/24`,
 `00:11:22:33:44:55`). All multi-byte fields are **big-endian** unless stated
@@ -69,21 +71,45 @@ size (88 bytes; 510 bytes for an `EXEC` QUERY):
 | 2 | `u16` `0x0001` |
 | 4 | ASCII command: `GET USB_DEVICE_LIST`, `EXEC SCANNER CONNECT:` or `EXEC SCANNER DISCONNECT:` |
 | … | parameters (`EXEC` only, directly after the command) |
-| 84 | `u16` operation code: `0` in QUERY; in COMMIT `0x0083` (device list) or `0x0003` (connect/disconnect) |
-| 86 | `u16` `0x0200` |
+| 84 | `u16` payload offset, initially `0`; COMMIT acknowledges the received payload length |
+| 86 | `u16` maximum reply payload, normally `0x0200` (512) |
+
+The earlier interpretation of `0x0083` and `0x0003` as operation codes was
+incorrect: they were the lengths of a captured device list and `OK\0`.
+The DS-600 Bluetooth list is 269 bytes (`0x010d`); `DENY\0` is 5 bytes.
+Query and commit use the same UDP socket/source port. Commit negative replies
+too, to finish the transaction before the next command.
 
 `EXEC` parameters: `01 06`, server MAC (6 bytes), host IPv4 (4 bytes), device ID
 (`dev01`, NUL-terminated); a CONNECT then adds the five bytes `4c 54 02 c0 53`,
-whose purpose is unknown (the server accepts them unchanged).
+encoding port 19540, flags `0x02` and a callback port. Flag `0x04` adds password
+authentication. DS-600 IDs use the form `usb1-002:0`.
+
+A password-enabled CONNECT query appends password length (one byte) at offset
+88 and encoded password bytes at offset 89, maximum 16 bytes. The header's host
+IPv4 seeds a reversible XOR stream. `build_password_connect` implements it;
+its test vectors were obtained by executing the firmware's ARM decoder in an
+emulator. This is protocol encoding and provides no cryptographic protection.
+The USB port password is independent of the web administration password.
 
 ### Device list reply
 
 | Offset | Field |
 |--------|-------|
 | 0 | `0x0001 0x0000` |
-| 4 | `u32` status / operation code (`0x83`, `0x87`, `0x0101` seen) |
+| 4 | `u16` fragment payload offset (zero for a complete single-datagram response) |
+| 6 | `u16` payload length |
 | 8 | `u8` number of entries |
 | 9 | entries |
+
+Lists exceeding 512 payload bytes arrive in fragments. A non-final fragment
+uses subcode `0x0001`. Request its successor with opcode `0x0002`, the same
+`GET USB_DEVICE_LIST` command and the cumulative payload offset at byte 84.
+Continuation replies use opcode `0x0002`; their byte-4 offset must match the
+assembled length. Subcode zero marks the final fragment. Commit the cumulative
+length with opcode `0x0003` only after the final fragment. The DS-600 ignores
+larger requested payload sizes and continues to send 512-byte fragments.
+This was verified with the ThinkPad dock's 15-interface list.
 
 Each entry has a variable-length head and a fixed 28-byte block:
 
@@ -91,9 +117,8 @@ Each entry has a variable-length head and a fixed 28-byte block:
 "dev01\0"                       device ID
 "         USB Flash Memory\0"   description (short names are left-padded with spaces)
 <4 bytes owner IPv4>            0.0.0.0 = free, otherwise the host that holds the device
--- fixed block, from the class marker --
-+0   u8   status (varies: 0x80, 0x84, 0x87, ...)
-+1   u8   0x83 (constant; the only reliable anchor)
+-- fixed block, directly after owner IPv4 --
++0   u16  status/capability flags (0x8083 on DS-510; 0x949b on this DS-600)
 +2   u16  idVendor
 +4   u16  idProduct
 +6   16 B tag, NUL-padded, e.g. "H112" or "H111M0"
@@ -103,11 +128,15 @@ Each entry has a variable-length head and a fixed 28-byte block:
 ```
 
 The first letter of the tag is the USB speed: `H` high speed (480 Mbit/s), `F`
-full speed (12 Mbit/s), `L` low speed (1.5 Mbit/s, assumed).
+full speed (12 Mbit/s), `L` low speed (1.5 Mbit/s), `S` SuperSpeed (5 Gbit/s).
+
+Neither status byte is a constant delimiter. The strings and fixed block lengths
+determine the entry boundaries. Status bit `0x0010` indicates a configured USB
+connection password, as established from the DS-600 server firmware.
 
 **Composite devices** are split into one entry per interface. The entries share
 VID:PID and the tag stem; the suffix `M0`, `M1`, … counts the interface, and
-`bDeviceClass` is `0xEF`. Each interface needs its own reservation and its own
+`bDeviceClass` can be `0xEF` (the DS-600 Bluetooth device instead reports `0xe0`). Each interface needs its own reservation and its own
 TCP connection (see below). OpenSilexLink shows them as one device, as the
 vendor client does.
 
@@ -126,14 +155,50 @@ Disconnect is symmetric: `EXEC SCANNER DISCONNECT:` as QUERY and COMMIT, then th
 TCP connection is closed. The next device list shows the device as free.
 
 The server can answer `NG` while it still holds a stale reservation, for example
-after it closed a tunnel itself. A DISCONNECT before the retry clears it.
+after it closed a tunnel itself. Do not disconnect a device held by another host. This client reports refusal
+without attempting to evict its owner.
 
 ## 2. USB tunnel (TCP 19540)
 
 The tunnel is a stream of frames; a frame is a header plus an optional payload,
 and frames are delimited by their length fields only.
 
-### Common prefix
+### DS-600 framing
+
+DS-600 control, interrupt and bulk requests insert `u16 = 1` after the
+sequence at offset 4. Their selector/tag move to offsets 6/8 and all subsequent
+fields move two bytes. Header lengths are control 22, interrupt/bulk 18.
+Isochronous requests already contain this word (24-byte header), but their
+timing fields differ: **offset 12 is a u16 endpoint bInterval**, and offset 14
+is reserved (zero). Do not write the legacy u32 frame counter there. The
+DS-600 firmware's `sxuptp_urb_create_isoc` converts the interval to
+`1 << (bInterval - 1)` for the USB URB. A frame counter in this field can
+produce an invalid interval and reset the interface's TCP connection. Use the
+endpoint descriptor's interval for both capture and playback.
+
+Responses have a **10-byte header**: opcode at 0, sequence at 2, status at 4,
+u32 payload length at 6, payload at 10. There is no second status word.
+For bulk, status **2** indicates a continuation with the same sequence; concatenate
+segments until the final status 0. Interleaved sequences must remain separate.
+
+A cancellation repeats the original request sequence/selector, sets opcode bit
+`0x4000`, and sends only its request header. It carries no OUT payload. The
+server removes the matching URB and suppresses its completion. Keep cancellation
+in the request queue so it cannot overtake the original submit. This also
+applies to isochronous transfers: use a concurrent sender and receiver, matching
+replies by sequence. At stream stop, pending capture transfers may not complete;
+blocking cancellation behind a FIFO read causes a timeout and drops every
+function on a composite dock. Cancelled iso requests carry only their 24-byte
+header and must not leave the receiver waiting for a suppressed response.
+
+Captured Bluetooth GET_DESCRIPTOR request and response:
+
+```text
+0001 0001 0001 0200 0205 0008 80 06 0100 0000 00000012
+0001 0001 0000 00000012 12010002e0010140b40401f9120101020301
+```
+
+### DS-510 common prefix
 
 | Offset | Field |
 |--------|-------|
@@ -142,10 +207,12 @@ and frames are delimited by their length fields only.
 | 4 | request: `u16` *sel*, high byte = **device index**, low byte = endpoint address. Response: `u16` status1 |
 | 6 | request: `u16` `0x0205`. Response: first half of the length field |
 
-The **device index** is `devNN` + 2 (`dev01` → `0x03`, `dev02` → `0x04`). Every
+For DS-510, the **device index** is `devNN` + 2 (`dev01` → `0x03`, `dev02` → `0x04`). Every
 request must carry the index of its target device, otherwise it reaches the first
 device. All interface connections of a composite device use the index of its
-first interface.
+first interface. This inference is from DS-510 only. DS-600 IDs `usbB-DDD:I`
+use DDD as the physical device address in the selector high byte; all interface
+sessions retain the primary address. The trailing I is an interface number.
 
 ### Requests
 
@@ -176,7 +243,8 @@ first interface.
 ```
 
 The server holds an interrupt-IN request open until the endpoint delivers a
-report (long poll). Responses on a connection with interrupt endpoints therefore
+report (long poll). Bulk reads can also wait for a later write, as on a
+DisplayLink dock. Responses on bulk and interrupt connections therefore
 do not come back in request order; they are matched by sequence number.
 
 **Isochronous** (24-byte header, the same for both directions):

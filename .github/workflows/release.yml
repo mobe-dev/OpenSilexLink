@@ -1,49 +1,39 @@
-# Release: push a version tag, CI builds the .deb and .rpm packages and publishes
-# them as a GitHub Release.
-#
-#   git tag v1.0.0 && git push origin v1.0.0
-#
-# The tag must match the versions in daemon/Cargo.toml, client/pyproject.toml and
-# client/src/opensilexlink/__init__.py; packaging/build-packages.sh stops otherwise.
 name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    tags: ["v*"]
 
 permissions:
-  contents: write # create the release and upload assets
+  contents: read
 
 jobs:
-  packages:
+  validate-and-build:
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ github.ref_name }}
+
+  publish:
+    needs: validate-and-build
     runs-on: ubuntu-24.04
-    env:
-      NFPM_VERSION: "2.43.0"
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          workspaces: daemon
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install build dependencies
-        run: |
-          python -m pip install --upgrade pip pytest
-          curl -sSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_amd64.deb" -o /tmp/nfpm.deb
-          sudo dpkg -i /tmp/nfpm.deb
-
-      - name: Build packages
-        # v1.0.0 -> 1.0.0 (deb/rpm versions must not start with "v")
-        run: PYTHON=python packaging/build-packages.sh "${GITHUB_REF_NAME#v}" dist
-
+          name: packages
+          path: dist/release
+      - name: Verify release assets
+        run: cd dist/release && sha256sum -c SHA256SUMS
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          fail_on_unmatched_files: true
+          body_path: CHANGELOG.md
           generate_release_notes: true
+          files: |
+            dist/release/opensilexlink_*.deb
+            dist/release/opensilexlink-*.rpm
+            dist/release/THIRD_PARTY_NOTICES.txt
+            dist/release/SHA256SUMS

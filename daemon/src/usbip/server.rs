@@ -6,9 +6,9 @@
 //!
 //! Concurrency: the reader routes each URB (via [`SilexDevice::session_for`]) to the queue
 //! of its connection, so control, iso and interrupt do not block each other. A plain
-//! bulk/control connection runs a synchronous worker; an iso connection runs a pipelined
-//! worker; a connection with an interrupt endpoint runs a multiplex sender+reader (the
-//! device holds interrupt-IN as a long-poll, so responses are matched to requests by seq).
+//! control-only connection runs a synchronous worker; an iso connection runs a pipelined
+//! worker; bulk and interrupt connections run a multiplex sender+reader so a pending
+//! read cannot block writes. Responses are matched to requests by sequence number.
 //! UNLINK is answered immediately; a send lock serializes RET_SUBMIT/RET_UNLINK.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -52,9 +52,11 @@ pub struct UsbipServer {
     host_ip: Option<String>,
     bind: (String, u16),
     device_port: u16,
-    devices: Vec<DeviceSlot>,
+    devices: StdMutex<Vec<DeviceSlot>>,
     active: Arc<Mutex<Vec<Arc<SilexDevice>>>>,
     listener: Mutex<Option<TcpListener>>,
+    usb_password: Option<Vec<u8>>,
+    device_speeds: StdMutex<HashMap<String, u32>>,
 }
 
 impl UsbipServer {
@@ -83,10 +85,45 @@ impl UsbipServer {
             host_ip,
             bind,
             device_port,
-            devices,
+            devices: StdMutex::new(devices),
             active: Arc::new(Mutex::new(Vec::new())),
             listener: Mutex::new(None),
+            usb_password: None,
+            device_speeds: StdMutex::new(HashMap::new()),
         }
+    }
+
+    pub fn with_usb_password(mut self, password: Option<Vec<u8>>) -> Self {
+        self.usb_password = password;
+        self
+    }
+
+    pub fn with_device_speeds(self, devices: &[crate::protocol::udp_discovery::UsbDeviceEntry]) -> Self {
+        self.update_speeds(devices);
+        self
+    }
+
+    fn update_speeds(&self, devices: &[crate::protocol::udp_discovery::UsbDeviceEntry]) {
+        let mut speeds = self.device_speeds.lock().unwrap();
+        speeds.clear();
+        for device in devices {
+            let speed = match device.tag.as_bytes().first() {
+                Some(b'L') => 1,
+                Some(b'F') => 2,
+                Some(b'H') => 3,
+                Some(b'S') => 5,
+                _ => continue,
+            };
+            speeds.insert(device.dev_id.clone(), speed);
+        }
+    }
+
+    pub fn update_devices(&self, devices: Vec<(String, String)>, speeds: &[crate::protocol::udp_discovery::UsbDeviceEntry]) {
+        *self.devices.lock().unwrap() = devices.into_iter().map(|(busid, dev_id)| {
+            let number = busid.strip_prefix("1-").and_then(|n| n.parse::<u32>().ok()).unwrap_or(1);
+            DeviceSlot { busid, dev_id, busnum: 1, devnum: 1 + number }
+        }).collect();
+        self.update_speeds(speeds);
     }
 
     /// Bind the listening socket up front so callers can attach without racing.
@@ -106,7 +143,7 @@ impl UsbipServer {
             self.host_ip.clone(),
             self.device_port,
             KEEPALIVE,
-        ))
+        ).with_usb_password(self.usb_password.clone()))
     }
 
     /// A sub-interface session of a composite device: same sel index as the primary.
@@ -119,11 +156,11 @@ impl UsbipServer {
             self.device_port,
             KEEPALIVE,
             Some(dev_index),
-        ))
+        ).with_usb_password(self.usb_password.clone()))
     }
 
-    fn slot(&self, busid: &str) -> Option<&DeviceSlot> {
-        self.devices.iter().find(|d| d.busid == busid)
+    fn slot(&self, busid: &str) -> Option<DeviceSlot> {
+        self.devices.lock().unwrap().iter().find(|d| d.busid == busid).cloned()
     }
 
     /// Disconnect all active devices cleanly (against stuck reservations).
@@ -139,7 +176,7 @@ impl UsbipServer {
             Some(l) => l,
             None => TcpListener::bind((self.bind.0.as_str(), self.bind.1)).await?,
         };
-        let devs: Vec<String> = self.devices.iter().map(|d| format!("{}->{}", d.busid, d.dev_id)).collect();
+        let devs: Vec<String> = self.devices.lock().unwrap().iter().map(|d| format!("{}->{}", d.busid, d.dev_id)).collect();
         tracing::info!("USB/IP server on {}:{} (@ {}: {})", self.bind.0, self.bind.1, self.server_ip, devs.join(", "));
         loop {
             let (conn, addr) = listener.accept().await?;
@@ -153,6 +190,9 @@ impl UsbipServer {
     }
 
     async fn handle(self: Arc<Self>, mut conn: TcpStream) -> Result<()> {
+        // Small interrupt/control completions (mouse and cursor updates) must
+        // not wait behind Nagle's algorithm while bulk framebuffer traffic is idle.
+        conn.set_nodelay(true)?;
         let mut op = [0u8; OpHeader::SIZE];
         conn.read_exact(&mut op).await?;
         let header = OpHeader::parse(&op)?;
@@ -179,7 +219,7 @@ impl UsbipServer {
             busid: slot.busid.clone(),
             busnum: slot.busnum,
             devnum: slot.devnum,
-            speed: speed_from_bcd(bcd_usb),
+            speed: self.device_speeds.lock().unwrap().get(&slot.dev_id).copied().unwrap_or_else(|| speed_from_bcd(bcd_usb)),
             id_vendor: u16::from_le_bytes([desc[8], desc[9]]),
             id_product: u16::from_le_bytes([desc[10], desc[11]]),
             bcd_device: u16::from_le_bytes([desc[12], desc[13]]),
@@ -212,7 +252,8 @@ impl UsbipServer {
 
     async fn handle_devlist(self: Arc<Self>, mut conn: TcpStream) -> Result<()> {
         let mut entries = Vec::new();
-        for slot in &self.devices {
+        let slots = self.devices.lock().unwrap().clone();
+        for slot in &slots {
             let dev = self.probe_device(slot).await?;
             let ifaces = vec![UsbInterface {
                 b_interface_class: if dev.b_device_class != 0 { dev.b_device_class } else { 8 },
@@ -299,14 +340,24 @@ enum Inflight {
 }
 
 /// Shared state of one imported device's URB pump.
+enum WorkerCommand {
+    Submit(UsbipCmdSubmit),
+    Cancel(u32),
+}
+
 struct Pump {
     wr: Mutex<OwnedWriteHalf>, // USB/IP socket write half (send RET_SUBMIT/RET_UNLINK)
     cancelled: StdMutex<HashSet<u32>>,
+    routes: StdMutex<HashMap<u32, Arc<SilexSession>>>,
     alive: AtomicBool,
     shutdown: Notify, // breaks the reader when a worker hits a fatal tunnel error
 }
 
 impl Pump {
+    fn close(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.shutdown.notify_one();
+    }
     fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
@@ -317,16 +368,19 @@ impl Pump {
 
     /// True when the URB should be processed (not cancelled meanwhile).
     fn take(&self, seqnum: u32) -> bool {
-        !self.cancelled.lock().unwrap().remove(&seqnum)
+        let cancelled = self.cancelled.lock().unwrap().remove(&seqnum);
+        if cancelled { self.routes.lock().unwrap().remove(&seqnum); }
+        !cancelled
     }
 
     /// Send RET_SUBMIT (with a cancel re-check). false => end the connection/worker.
     async fn complete(&self, ret: &UsbipRetSubmit) -> bool {
+        self.routes.lock().unwrap().remove(&ret.seqnum);
         if self.cancelled.lock().unwrap().remove(&ret.seqnum) {
             return true;
         }
         if self.send(&ret.to_bytes()).await.is_err() {
-            self.alive.store(false, Ordering::SeqCst);
+            self.close();
             return false;
         }
         true
@@ -346,8 +400,7 @@ impl Pump {
             ..Default::default()
         };
         let _ = self.send(&ret.to_bytes()).await;
-        self.alive.store(false, Ordering::SeqCst);
-        self.shutdown.notify_one();
+        self.close();
     }
 }
 
@@ -360,14 +413,19 @@ async fn urb_pump(conn: TcpStream, device: Arc<SilexDevice>) -> Result<()> {
     let pump = Arc::new(Pump {
         wr: Mutex::new(wr),
         cancelled: StdMutex::new(HashSet::new()),
+        routes: StdMutex::new(HashMap::new()),
         alive: AtomicBool::new(true),
         shutdown: Notify::new(),
     });
 
     let sessions = device.sessions();
-    let iso = device.iso_sessions();
+    // DS-600 supports sequence-based cancellation for iso too. A FIFO reader
+    // blocks cancellation at stream stop and eventually times out, taking the
+    // other functions of a composite dock down with it.
+    let iso: Vec<_> = device.iso_sessions().into_iter()
+        .filter(|session| !session.dev_id.starts_with("usb")).collect();
     let mux: Vec<Arc<SilexSession>> = device
-        .interrupt_sessions()
+        .multiplex_sessions()
         .into_iter()
         .filter(|s| !contains(&iso, s))
         .collect();
@@ -378,10 +436,10 @@ async fn urb_pump(conn: TcpStream, device: Arc<SilexDevice>) -> Result<()> {
         s.stop_keepalive();
     }
 
-    let mut senders: Vec<(Arc<SilexSession>, mpsc::Sender<UsbipCmdSubmit>)> = Vec::new();
+    let mut senders: Vec<(Arc<SilexSession>, mpsc::Sender<WorkerCommand>)> = Vec::new();
     let mut tasks = Vec::new();
     for s in &sessions {
-        let (tx, rx) = mpsc::channel::<UsbipCmdSubmit>(64);
+        let (tx, rx) = mpsc::channel::<WorkerCommand>(64);
         senders.push((s.clone(), tx));
         if contains(&iso, s) {
             tasks.push(tokio::spawn(iso_worker(pump.clone(), s.clone(), rx)));
@@ -410,13 +468,14 @@ async fn reader_loop(
     mut rd: OwnedReadHalf,
     pump: Arc<Pump>,
     device: Arc<SilexDevice>,
-    senders: Vec<(Arc<SilexSession>, mpsc::Sender<UsbipCmdSubmit>)>,
+    senders: Vec<(Arc<SilexSession>, mpsc::Sender<WorkerCommand>)>,
 ) {
     loop {
         let mut head = [0u8; UsbipCmdSubmit::HEADER_SIZE];
         tokio::select! {
             res = rd.read_exact(&mut head) => {
-                if res.is_err() {
+                if let Err(error) = res {
+                    tracing::debug!(%error, "USB/IP request stream ended");
                     break;
                 }
             }
@@ -424,13 +483,17 @@ async fn reader_loop(
         }
         let command = match up::peek_command(&head) {
             Ok(c) => c,
-            Err(_) => break,
+            Err(error) => { tracing::warn!(%error, "invalid USB/IP command header"); break; },
         };
         if command == up::USBIP_CMD_SUBMIT {
             let mut cmd = match UsbipCmdSubmit::parse(&head, Vec::new()) {
                 Ok(c) => c,
-                Err(_) => break,
+                Err(error) => { tracing::warn!(%error, "invalid USB/IP submit"); break; },
             };
+            if cmd.transfer_buffer_length > 16 * 1024 * 1024 || (cmd.number_of_packets != u32::MAX && cmd.number_of_packets > 1024) {
+                tracing::warn!("USB/IP transfer limit exceeded");
+                break;
+            }
             if !cmd.is_in() && cmd.transfer_buffer_length > 0 {
                 let mut body = vec![0u8; cmd.transfer_buffer_length as usize];
                 if rd.read_exact(&mut body).await.is_err() {
@@ -450,8 +513,11 @@ async fn reader_loop(
                 }
             }
             let target = device.session_for(&cmd);
+            tracing::debug!(seq = cmd.seqnum, ep = cmd.ep, direction = cmd.direction,
+                length = cmd.transfer_buffer_length, "USB/IP submit");
             if let Some((_s, tx)) = senders.iter().find(|(s, _)| Arc::ptr_eq(s, &target)) {
-                if tx.send(cmd).await.is_err() {
+                pump.routes.lock().unwrap().insert(cmd.seqnum, target.clone());
+                if tx.send(WorkerCommand::Submit(cmd)).await.is_err() {
                     break;
                 }
             }
@@ -461,19 +527,27 @@ async fn reader_loop(
                 Err(_) => break,
             };
             pump.cancelled.lock().unwrap().insert(unlink.unlink_seqnum);
+            let route = pump.routes.lock().unwrap().get(&unlink.unlink_seqnum).cloned();
+            if let Some(target) = route {
+                if let Some((_, tx)) = senders.iter().find(|(s, _)| Arc::ptr_eq(s, &target)) {
+                    if tx.send(WorkerCommand::Cancel(unlink.unlink_seqnum)).await.is_err() { break; }
+                }
+            }
             let bytes = UsbipRetUnlink { seqnum: unlink.seqnum, status: 0 }.to_bytes();
             if pump.send(&bytes).await.is_err() {
                 break;
             }
         } else {
+            tracing::warn!(command, "unknown USB/IP command");
             break;
         }
     }
 }
 
 /// Synchronous worker for a plain bulk/control connection.
-async fn plain_worker(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Receiver<UsbipCmdSubmit>) {
-    while let Some(cmd) = rx.recv().await {
+async fn plain_worker(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Receiver<WorkerCommand>) {
+    while let Some(command) = rx.recv().await {
+        let WorkerCommand::Submit(cmd) = command else { continue };
         if !pump.take(cmd.seqnum) {
             continue;
         }
@@ -494,7 +568,7 @@ async fn plain_worker(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Re
 /// Iso connection like SX Virtual Link: send many requests continuously ahead and read the
 /// responses trailing (a deep pipeline buffer against jitter). A single task owns the
 /// socket; while idle it keepalives itself. Responses arrive FIFO -> in-flight is a deque.
-async fn iso_worker(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Receiver<UsbipCmdSubmit>) {
+async fn iso_worker(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Receiver<WorkerCommand>) {
     let mut inflight: VecDeque<UsbipCmdSubmit> = VecDeque::new();
     let ka = if sess.keepalive_interval.is_zero() { KEEPALIVE } else { sess.keepalive_interval };
     // Load iso-OUT formats ONCE (a control transfer) while nothing is in flight -> controls
@@ -506,11 +580,12 @@ async fn iso_worker(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Rece
         // 1) send ahead: all immediately available URBs (up to the pipeline ceiling).
         while inflight.len() < ISO_MAX_INFLIGHT {
             match rx.try_recv() {
-                Ok(cmd) => {
+                Ok(WorkerCommand::Submit(cmd)) => {
                     if !iso_enqueue(&pump, &sess, cmd, &mut inflight).await {
                         return;
                     }
                 }
+                Ok(WorkerCommand::Cancel(_)) => continue,
                 Err(_) => break, // empty or disconnected
             }
         }
@@ -537,11 +612,12 @@ async fn iso_worker(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Rece
         } else {
             // Pipeline empty: block for the next URB; on idle (timeout) keepalive ourselves.
             match timeout(ka, rx.recv()).await {
-                Ok(Some(cmd)) => {
+                Ok(Some(WorkerCommand::Submit(cmd))) => {
                     if !iso_enqueue(&pump, &sess, cmd, &mut inflight).await {
                         return;
                     }
                 }
+                Ok(Some(WorkerCommand::Cancel(_))) => continue,
                 Ok(None) => return, // channel closed
                 Err(_) => {
                     if sess.get_device_descriptor().await.is_err() {
@@ -581,10 +657,10 @@ fn ep_info(device: &SilexDevice, cmd: &UsbipCmdSubmit) -> (Option<u8>, u16, u16)
 
 type MuxInflight = Arc<StdMutex<HashMap<u16, Inflight>>>;
 
-/// Mux sender: take URBs (control/interrupt/bulk) off the queue and send them into the
+/// Mux sender: take URBs (control/interrupt/bulk/DS-600 iso) off the queue and send them into the
 /// tunnel without waiting for the response (the reader dispatches by seq). Interrupt-IN is
 /// held open (long-poll) -> must not block control. While idle this sender keepalives.
-async fn mux_sender(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Receiver<UsbipCmdSubmit>, inflight: MuxInflight, device: Arc<SilexDevice>) {
+async fn mux_sender(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Receiver<WorkerCommand>, inflight: MuxInflight, device: Arc<SilexDevice>) {
     let ka = if sess.keepalive_interval.is_zero() { KEEPALIVE } else { sess.keepalive_interval };
     while pump.is_alive() {
         match timeout(ka, rx.recv()).await {
@@ -594,7 +670,30 @@ async fn mux_sender(pump: Arc<Pump>, sess: Arc<SilexSession>, mut rx: mpsc::Rece
                 }
             }
             Ok(None) => return, // channel closed
-            Ok(Some(cmd)) => {
+            Ok(Some(WorkerCommand::Cancel(usbip_seq))) => {
+                // Submit and Cancel share this queue, so cancel cannot overtake
+                // the original request on the wire.
+                let removed = {
+                    let mut waiting = inflight.lock().unwrap();
+                    let seq = waiting.iter().find_map(|(seq, entry)| match entry {
+                        Inflight::Cmd(cmd) if cmd.seqnum == usbip_seq => Some(*seq),
+                        _ => None,
+                    });
+                    seq.and_then(|seq| waiting.remove(&seq).map(|entry| (seq, entry)))
+                };
+                if let Some((seq, Inflight::Cmd(cmd))) = removed {
+                    let (kind, mps, interval) = ep_info(&device, &cmd);
+                    let mut frame = build_request(&sess, &cmd, kind, mps, interval);
+                    frame.seq = seq;
+                    if let Err(error) = sess.cancel_request(frame).await {
+                        pump.abort_tunnel(&cmd, error).await;
+                        return;
+                    }
+                }
+                pump.routes.lock().unwrap().remove(&usbip_seq);
+                pump.cancelled.lock().unwrap().remove(&usbip_seq);
+            }
+            Ok(Some(WorkerCommand::Submit(cmd))) => {
                 if !pump.take(cmd.seqnum) {
                     continue;
                 }
@@ -617,7 +716,7 @@ async fn mux_keepalive(pump: &Pump, sess: &SilexSession, inflight: &StdMutex<Has
     let seq = frame.seq;
     inflight.lock().unwrap().insert(seq, Inflight::Keepalive);
     if sess.send_request(frame).await.is_err() {
-        pump.alive.store(false, Ordering::SeqCst);
+        pump.close();
         return false;
     }
     true
@@ -630,7 +729,7 @@ async fn mux_reader(pump: Arc<Pump>, sess: Arc<SilexSession>, inflight: MuxInfli
         let resp = match sess.recv_response().await {
             Ok(r) => r,
             Err(_) => {
-                pump.alive.store(false, Ordering::SeqCst);
+                pump.close();
                 return;
             }
         };
@@ -643,5 +742,129 @@ async fn mux_reader(pump: Arc<Pump>, sess: Arc<SilexSession>, inflight: MuxInfli
             }
             _ => continue, // keepalive / unknown -> discard
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn stream_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        (client, server)
+    }
+
+    fn bulk_submit(seq: u32, direction: u32, ep: u32) -> Vec<u8> {
+        let mut head = vec![0; 48];
+        for (offset, value) in [(0, up::USBIP_CMD_SUBMIT), (4, seq), (12, direction), (16, ep), (24, 1)] {
+            head[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        if direction == up::USBIP_DIR_OUT { head.push(0xAA); }
+        head
+    }
+
+    fn iso_input_submit(seq: u32) -> Vec<u8> {
+        let mut bytes = vec![0; 64];
+        for (offset, value) in [(0, up::USBIP_CMD_SUBMIT), (4, seq),
+            (12, up::USBIP_DIR_IN), (16, 1), (24, 4), (32, 1), (36, 8), (52, 4)] {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
+    #[tokio::test]
+    async fn ds600_iso_cancel_does_not_wait_for_capture_and_next_stream_still_works() {
+        timeout(Duration::from_secs(2), async {
+            let (tunnel, mut hardware) = stream_pair().await;
+            let session = Arc::new(SilexSession::new("127.0.0.1", [0; 6], "usb5-005:0", None, 19540, Duration::ZERO));
+            session.use_test_stream(tunnel).await;
+            let config = [9, 4, 0, 1, 1, 1, 2, 0x20, 0, 7, 5, 0x81, 5, 4, 0, 4];
+            let device = Arc::new(SilexDevice::build(session, &config, "usb5-005:0", |_| panic!("only one interface")).await.unwrap());
+            let (mut client, server) = stream_pair().await;
+            let pump = tokio::spawn(urb_pump(server, device));
+            client.write_all(&iso_input_submit(41)).await.unwrap();
+            let mut request = [0; 36];
+            hardware.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request[..2], &[0, 4]);
+            assert_eq!(&request[12..16], &[0, 4, 0, 0]);
+            // Capture is pending forever: the sender must still process UNLINK.
+            let mut unlink = [0; 48];
+            unlink[..4].copy_from_slice(&up::USBIP_CMD_UNLINK.to_be_bytes());
+            unlink[4..8].copy_from_slice(&42u32.to_be_bytes());
+            unlink[20..24].copy_from_slice(&41u32.to_be_bytes());
+            client.write_all(&unlink).await.unwrap();
+            let mut cancel = [0; 24];
+            hardware.read_exact(&mut cancel).await.unwrap();
+            assert_eq!(&cancel[..2], &[0x40, 4]);
+            assert_eq!(&cancel[2..10], &request[2..10]);
+            let mut ret = [0; 48];
+            client.read_exact(&mut ret).await.unwrap();
+            assert_eq!(&ret[..4], &up::USBIP_RET_UNLINK.to_be_bytes());
+            // Restart capture; no completion for the cancelled request is sent.
+            client.write_all(&iso_input_submit(43)).await.unwrap();
+            hardware.read_exact(&mut request).await.unwrap();
+            let payload = [0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 1, 2, 3, 4];
+            let mut reply = request[..4].to_vec();
+            reply.extend_from_slice(&[0, 0]);
+            reply.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+            reply.extend_from_slice(&payload);
+            hardware.write_all(&reply).await.unwrap();
+            client.read_exact(&mut ret).await.unwrap();
+            assert_eq!(&ret[4..8], &43u32.to_be_bytes());
+            assert_eq!(&ret[24..28], &4u32.to_be_bytes());
+            assert_eq!(&ret[32..36], &1u32.to_be_bytes());
+            let mut data = [0; 20];
+            client.read_exact(&mut data).await.unwrap();
+            assert_eq!(&data[..4], &[1, 2, 3, 4]);
+            assert_eq!(&data[12..16], &4u32.to_be_bytes());
+            // A real tunnel EOF must wake the USB/IP reader, even with no commands.
+            drop(hardware);
+            pump.await.unwrap().unwrap();
+        }).await.expect("iso cancellation blocked behind a pending capture");
+    }
+
+    #[tokio::test]
+    async fn bulk_read_does_not_block_write_on_interface_without_interrupt_endpoint() {
+        timeout(Duration::from_secs(2), async {
+            let (tunnel, mut hardware) = stream_pair().await;
+            let session = Arc::new(SilexSession::new("127.0.0.1", [0; 6], "usb5-005:0", None, 19540, Duration::ZERO));
+            session.use_test_stream(tunnel).await;
+            let config = [
+                9, 4, 0, 0, 2, 0xFF, 0, 3, 0,
+                7, 5, 0x84, 2, 0, 4, 0,
+                7, 5, 0x02, 2, 0, 4, 0,
+            ];
+            let device = Arc::new(SilexDevice::build(session, &config, "usb5-005:0", |_| panic!("only one interface")).await.unwrap());
+            let (mut client, server) = stream_pair().await;
+            let pump = tokio::spawn(urb_pump(server, device));
+            client.write_all(&bulk_submit(41, up::USBIP_DIR_IN, 4)).await.unwrap();
+            client.write_all(&bulk_submit(42, up::USBIP_DIR_OUT, 2)).await.unwrap();
+            // The hardware waits for the command before answering the earlier read.
+            let mut read = [0; 18];
+            hardware.read_exact(&mut read).await.unwrap();
+            assert_eq!(&read[..2], &[0, 3]);
+            let mut write = [0; 19];
+            hardware.read_exact(&mut write).await.unwrap();
+            assert_eq!(&write[..2], &[0x80, 3]);
+            assert_eq!(write[18], 0xAA);
+            for (request, payload) in [(&write[..], &[][..]), (&read[..], &[0xBB][..])] {
+                let mut response = vec![request[0], request[1], request[2], request[3], 0, 0];
+                response.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+                response.extend_from_slice(payload);
+                hardware.write_all(&response).await.unwrap();
+            }
+            let mut ret = [0; 48];
+            client.read_exact(&mut ret).await.unwrap();
+            assert_eq!(&ret[4..8], &42u32.to_be_bytes());
+            assert_eq!(&ret[20..24], &[0; 4]);
+            client.read_exact(&mut ret).await.unwrap();
+            assert_eq!(&ret[4..8], &41u32.to_be_bytes());
+            assert_eq!(&ret[20..24], &[0; 4]);
+            assert_eq!(client.read_u8().await.unwrap(), 0xBB);
+            drop(client);
+            pump.await.unwrap().unwrap();
+        }).await.expect("bulk IN blocked a later OUT request");
     }
 }

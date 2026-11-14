@@ -5,6 +5,7 @@
 //! which makes the device announce itself and add us to its notify list).
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,6 +15,64 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout, Instant};
 
 use crate::protocol::udp_discovery::{self as ud, Announcement, Message};
+
+/// Device lists larger than 512 bytes require opcode 2 continuation requests.
+/// Keep transfers separate by sender and publish only a complete, valid list.
+#[derive(Default)]
+struct DeviceLists(HashMap<SocketAddr, (Vec<u8>, Instant)>);
+
+impl DeviceLists {
+    fn receive(&mut self, addr: SocketAddr, data: &[u8]) -> (Option<Message>, Option<Vec<u8>>) {
+        self.0.retain(|_, (_, seen)| seen.elapsed() < Duration::from_secs(5));
+        if data.len() < 8 {
+            return (ud::parse(data).ok(), None);
+        }
+        let opcode = u16::from_be_bytes([data[0], data[1]]);
+        let more = u16::from_be_bytes([data[2], data[3]]);
+        let offset = u16::from_be_bytes([data[4], data[5]]) as usize;
+        let length = u16::from_be_bytes([data[6], data[7]]) as usize;
+        let first = opcode == 1 && offset == 0 && data.len() >= 9
+            && (data[8] == 0 || data[9..].starts_with(b"usb") || data[9..].starts_with(b"dev"));
+        let continuation = opcode == 2 && self.0.contains_key(&addr);
+        if opcode == 2 && more <= 1 && !continuation {
+            return (None, None);
+        }
+        if more > 1 || !(first || continuation) {
+            return (ud::parse(data).ok(), None);
+        }
+        if data.len() != 8 + length || length == 0 || offset + length > u16::MAX as usize {
+            self.0.remove(&addr);
+            return (None, None);
+        }
+        if first {
+            self.0.insert(addr, (Vec::new(), Instant::now()));
+        }
+        let (payload, seen) = self.0.get_mut(&addr).unwrap();
+        // Retransmissions are harmless; missing or conflicting bytes never form a list.
+        if offset < payload.len() && offset + length <= payload.len()
+            && payload[offset..offset + length] == data[8..] {
+        } else if offset == payload.len() {
+            payload.extend_from_slice(&data[8..]);
+        } else {
+            self.0.remove(&addr);
+            return (None, None);
+        }
+        *seen = Instant::now();
+        let total = payload.len();
+        let mut reply = ud::build_get_device_list(ud::Phase::Query, Some(total as u16));
+        if more == 1 {
+            reply[..2].copy_from_slice(&2u16.to_be_bytes());
+            return (None, Some(reply));
+        }
+        let (payload, _) = self.0.remove(&addr).unwrap();
+        let mut complete = vec![0, 1, 0, 0, 0, 0];
+        complete.extend_from_slice(&(total as u16).to_be_bytes());
+        complete.extend_from_slice(&payload);
+        let message = ud::parse(&complete).ok().filter(|m| matches!(m, Message::DeviceList(_)));
+        reply[..2].copy_from_slice(&3u16.to_be_bytes());
+        (message, Some(reply))
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DeviceServer {
@@ -109,13 +168,27 @@ pub async fn discover(timeout_dur: Duration, broadcast: &str) -> Vec<DeviceServe
     let mut servers: HashMap<String, DeviceServer> = HashMap::new();
     let deadline = Instant::now() + timeout_dur;
     let mut buf = [0u8; 4096];
+    let mut lists = DeviceLists::default();
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             break;
         }
         match timeout(remaining, sock.recv_from(&mut buf)).await {
-            Ok(Ok((n, addr))) => ingest(&mut servers, addr.ip().to_string(), &buf[..n]),
+            Ok(Ok((n, addr))) => {
+                let (message, reply) = lists.receive(addr, &buf[..n]);
+                if let Some(reply) = reply {
+                    let _ = sock.send_to(&reply, addr).await;
+                }
+                if let Some(message) = message {
+                    match message {
+                        Message::DeviceList(list) => {
+                            servers.entry(addr.ip().to_string()).or_insert_with(|| DeviceServer::new(&addr.ip().to_string())).devices = list.devices;
+                        }
+                        _ => ingest(&mut servers, addr.ip().to_string(), &buf[..n]),
+                    }
+                }
+            }
             _ => break,
         }
     }
@@ -138,10 +211,15 @@ impl DiscoveryListener {
         let recv_sock = sock.clone();
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
+            let mut lists = DeviceLists::default();
             loop {
                 match recv_sock.recv_from(&mut buf).await {
                     Ok((n, addr)) => {
-                        if let Ok(msg) = ud::parse(&buf[..n]) {
+                        let (message, reply) = lists.receive(addr, &buf[..n]);
+                        if let Some(reply) = reply {
+                            let _ = recv_sock.send_to(&reply, addr).await;
+                        }
+                        if let Some(msg) = message {
                             if tx.send((addr.ip().to_string(), msg)).await.is_err() {
                                 return;
                             }
@@ -164,6 +242,53 @@ impl DiscoveryListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn list_fragment(op: u16, more: u16, offset: usize, payload: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::new();
+        for field in [op, more, offset as u16, payload.len() as u16] {
+            packet.extend_from_slice(&field.to_be_bytes());
+        }
+        packet.extend_from_slice(payload);
+        packet
+    }
+
+    #[test]
+    fn fragmented_list_waits_for_all_bytes_and_requests_continuation() {
+        let addr = "192.0.2.1:19540".parse().unwrap();
+        let mut reader = DeviceLists::default();
+        let mut payload = vec![1];
+        payload.extend_from_slice(b"usb5-005:0\0DisplayLink Dock\0");
+        payload.extend_from_slice(&[0; 32]);
+        let split = 20; // inside the description; the first fragment cannot be parsed
+        let (message, next) = reader.receive(addr, &list_fragment(1, 1, 0, &payload[..split]));
+        assert!(message.is_none());
+        let next = next.unwrap();
+        assert_eq!(&next[..2], &[0, 2]);
+        assert_eq!(&next[84..86], &(split as u16).to_be_bytes());
+        let (message, commit) = reader.receive(addr, &list_fragment(2, 0, split, &payload[split..]));
+        let Some(Message::DeviceList(list)) = message else { panic!("expected complete list") };
+        assert_eq!(list.devices[0].description, "DisplayLink Dock");
+        let commit = commit.unwrap();
+        assert_eq!(&commit[..2], &[0, 3]);
+        assert_eq!(&commit[84..86], &(payload.len() as u16).to_be_bytes());
+        assert!(reader.0.is_empty());
+    }
+
+    #[test]
+    fn fragmented_list_rejects_missing_bytes_and_expired_transfers() {
+        let addr = "192.0.2.1:19540".parse().unwrap();
+        let mut reader = DeviceLists::default();
+        let first = list_fragment(1, 1, 0, b"\x01usb5-005:0\0Dock");
+        reader.receive(addr, &first);
+        assert_eq!(reader.receive(addr, &list_fragment(2, 0, 30, b"tail")), (None, None));
+        assert!(reader.0.is_empty());
+        reader.receive(addr, &first);
+        reader.0.get_mut(&addr).unwrap().1 = Instant::now() - Duration::from_secs(6);
+        let (message, reply) = reader.receive(addr, &list_fragment(2, 0, 14, b"tail"));
+        assert!(!matches!(message, Some(Message::DeviceList(_))));
+        assert!(reply.is_none());
+        assert!(reader.0.is_empty());
+    }
 
     #[test]
     fn mac_str_formats() {

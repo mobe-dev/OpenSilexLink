@@ -81,10 +81,19 @@ pub struct SilexSession {
     // not loaded yet. Only Audio/AudioStreaming endpoints are listed; controls whether an
     // OUT iso endpoint may be compressed.
     iso_out_format: StdMutex<Option<HashMap<u8, (u16, u8, u8)>>>,
+    endpoint_params: StdMutex<HashMap<u8, (u16, u16)>>,
     ka: StdMutex<Option<JoinHandle<()>>>,
+    usb_password: Option<Vec<u8>>,
+    partial_bulk: StdMutex<HashMap<(u16, u16), Vec<u8>>>,
 }
 
 impl SilexSession {
+    #[cfg(test)]
+    pub async fn use_test_stream(&self, stream: TcpStream) {
+        let (read, write) = stream.into_split();
+        *self.read.lock().await = Some(read);
+        *self.write.lock().await = Some(write);
+    }
     pub fn new(
         server_ip: &str,
         mac: [u8; 6],
@@ -128,20 +137,46 @@ impl SilexSession {
             io_lock: Mutex::new(()),
             iso_frame: StdMutex::new(seed),
             iso_out_format: StdMutex::new(None),
+            endpoint_params: StdMutex::new(HashMap::new()),
             ka: StdMutex::new(None),
+            usb_password: None,
+            partial_bulk: StdMutex::new(HashMap::new()),
         }
     }
 
+    pub fn with_usb_password(mut self, password: Option<Vec<u8>>) -> Self {
+        self.usb_password = password;
+        self
+    }
+
     // -- UDP handshake ----------------------------------------------------- //
-    async fn udp_exchange(&self, payload: &[u8]) -> Result<Message> {
+    async fn udp_transaction(&self, query: &[u8]) -> Result<Message> {
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
         sock.connect((self.server_ip.as_str(), self.port)).await?;
-        sock.send(payload).await?;
+        sock.send(query).await?;
         let mut buf = [0u8; 4096];
         let n = timeout(self.timeout, sock.recv(&mut buf))
             .await
             .map_err(|_| anyhow::anyhow!("UDP timeout"))??;
-        ud::parse(&buf[..n])
+        crate::wire::need(&buf[..n], 8, "control response")?;
+        if buf[..4] != [0, 1, 0, 0] {
+            bail!("unexpected control response header");
+        }
+        let declared = crate::wire::rd_u16(&buf, 6) as usize;
+        if crate::wire::rd_u16(&buf, 4) != 0 || declared != n - 8 {
+            bail!("invalid control response offset or length");
+        }
+        let response = ud::parse(&buf[..n])?;
+        // The same socket/source port must span query and commit. Commit even
+        // DENY/NG so the next transaction does not hit a retained response.
+        sock.send(&ud::build_commit(query, declared)?).await?;
+        let n = timeout(self.timeout, sock.recv(&mut buf))
+            .await
+            .map_err(|_| anyhow::anyhow!("UDP commit timeout"))??;
+        if buf[..n] != [0, 3, 0, 0, 0, 0, 0, 0] {
+            bail!("unexpected control commit acknowledgement");
+        }
+        Ok(response)
     }
 
     pub async fn connect(&self) -> Result<()> {
@@ -155,11 +190,17 @@ impl SilexSession {
         let mut ok = false;
         let mut last = String::new();
         for attempt in 0..=retries {
-            let query = ud::build_connect(&self.mac, &self.host_ip, &self.dev_id, Phase::Query, &ud::CONNECT_TOKEN, None)?;
-            match self.udp_exchange(&query).await {
+            let query = match &self.usb_password {
+                Some(password) => ud::build_password_connect(&self.mac, &self.host_ip, &self.dev_id, password)?,
+                None => ud::build_connect(&self.mac, &self.host_ip, &self.dev_id, Phase::Query, &ud::CONNECT_TOKEN, None)?,
+            };
+            match self.udp_transaction(&query).await {
                 Ok(Message::Simple(r)) if r.text.starts_with("OK") => {
                     ok = true;
                     break;
+                }
+                Ok(Message::Simple(r)) if r.text.starts_with("DENY") => {
+                    bail!("CONNECT denied: check the DS-600 USB port connection password and device-server settings");
                 }
                 Ok(other) => last = format!("{other:?}"),
                 Err(e) => last = e.to_string(),
@@ -172,15 +213,33 @@ impl SilexSession {
         if !ok {
             bail!("CONNECT query rejected: {last}");
         }
-        let commit = ud::build_connect(&self.mac, &self.host_ip, &self.dev_id, Phase::Commit, &ud::CONNECT_TOKEN, None)?;
-        let _ = self.udp_exchange(&commit).await;
-
-        let stream = timeout(
+        let tcp_result = timeout(
             self.timeout,
-            TcpStream::connect((self.server_ip.as_str(), self.port)),
+            async {
+                loop {
+                    match TcpStream::connect((self.server_ip.as_str(), self.port)).await {
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                            // DS-600 starts its listener asynchronously after OK.
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        result => break result,
+                    }
+                }
+            },
         )
-        .await
-        .map_err(|_| anyhow::anyhow!("TCP connect timeout"))??;
+        .await;
+        let stream = match tcp_result {
+            Ok(Ok(stream)) => stream,
+            failed => {
+                // The UDP commit has already reserved the device. A failed TCP
+                // connection must release it, including failures during probe.
+                self.udp_release().await;
+                return match failed {
+                    Ok(Err(e)) => Err(e.into()),
+                    _ => Err(anyhow::anyhow!("TCP connect timeout")),
+                };
+            }
+        };
         // Iso audio is a small request/response stream with ~1000 rounds/s. Without
         // TCP_NODELAY Nagle delays small requests and throughput collapses.
         stream.set_nodelay(true).ok();
@@ -188,6 +247,7 @@ impl SilexSession {
         *self.read.lock().await = Some(rd);
         *self.write.lock().await = Some(wr);
         *self.seq.lock().unwrap() = 0;
+        self.partial_bulk.lock().unwrap().clear();
         Ok(())
     }
 
@@ -220,10 +280,8 @@ impl SilexSession {
 
     /// Release the device reservation (DISCONNECT QUERY+COMMIT, UDP only).
     pub async fn udp_release(&self) {
-        for phase in [Phase::Query, Phase::Commit] {
-            if let Ok(pkt) = ud::build_disconnect(&self.mac, &self.host_ip, &self.dev_id, phase, None) {
-                let _ = self.udp_exchange(&pkt).await;
-            }
+        if let Ok(pkt) = ud::build_disconnect(&self.mac, &self.host_ip, &self.dev_id, Phase::Query, None) {
+            let _ = self.udp_transaction(&pkt).await;
         }
     }
 
@@ -258,6 +316,14 @@ impl SilexSession {
     }
 
     // -- low-level tunnel I/O ---------------------------------------------- //
+    fn encode_request(&self, frame: &SilexFrame) -> Vec<u8> {
+        if self.dev_id.starts_with("usb") {
+            frame.to_ds600_request_bytes()
+        } else {
+            frame.to_bytes()
+        }
+    }
+
     async fn send_bytes(&self, bytes: &[u8]) -> std::result::Result<(), TransferError> {
         let mut w = self.write.lock().await;
         let s = w.as_mut().ok_or(TransferError::Closed)?;
@@ -270,22 +336,45 @@ impl SilexSession {
         let mut r = self.read.lock().await;
         let s = r.as_mut().ok_or(TransferError::Closed)?;
         let to = if block { None } else { Some(self.timeout) };
-        let mut head = [0u8; 12];
+        let ds600 = self.dev_id.starts_with("usb");
+        loop {
+        let mut head = vec![0u8; if ds600 { 10 } else { 12 }];
         read_exact_opt(s, &mut head, to).await?;
         let dlen = u32::from_be_bytes([head[6], head[7], head[8], head[9]]) as usize;
+        if dlen > 16 * 1024 * 1024 {
+            return Err(TransferError::Other(anyhow::anyhow!("Silex response exceeds 16 MiB")));
+        }
         let mut full = head.to_vec();
         if dlen > 0 {
             let mut body = vec![0u8; dlen];
             read_exact_opt(s, &mut body, to).await?;
             full.extend_from_slice(&body);
         }
-        let (frame, _) = SilexFrame::parse(&full, 0).map_err(TransferError::Other)?;
-        Ok(frame)
+        let mut frame = if ds600 {
+            SilexFrame::parse_ds600_response(&full)
+        } else {
+            SilexFrame::parse(&full, 0).map(|(frame, _)| frame)
+        }.map_err(TransferError::Other)?;
+        tracing::debug!(device = %self.dev_id, seq = frame.seq, status = frame.status1,
+            length = frame.data.len(), "Silex response");
+        if ds600 && frame.opcode & 0xff == 3 {
+            let mut pending = self.partial_bulk.lock().unwrap();
+            let prior = pending.get(&(frame.opcode, frame.seq)).map(Vec::len).unwrap_or(0);
+            if pending.len() >= 128 || prior + frame.data.len() > 16 * 1024 * 1024 {
+                pending.clear();
+                return Err(TransferError::Other(anyhow::anyhow!("Silex continuation limit exceeded")));
+            }
+            if !assemble_bulk_response(&mut pending, &mut frame) {
+                continue;
+            }
+        }
+        return Ok(frame);
+        }
     }
 
     /// Send a request frame (seq already assigned) and read its response atomically.
     async fn transfer(&self, req: SilexFrame) -> std::result::Result<SilexFrame, TransferError> {
-        let bytes = req.to_bytes();
+        let bytes = self.encode_request(&req);
         let _g = self.io_lock.lock().await;
         self.send_bytes(&bytes).await?;
         self.recv_frame(false).await
@@ -350,7 +439,7 @@ impl SilexSession {
         }
     }
 
-    fn build_iso_in_frame(&self, endpoint: u8, packets: Vec<(u32, u32)>, start_frame: u32,
+    pub fn build_iso_in_frame(&self, endpoint: u8, packets: Vec<(u32, u32)>, start_frame: u32,
                           maxpacket: u16, total_length: u32) -> SilexFrame {
         let ep = (endpoint & 0x7F) | 0x80;
         SilexFrame {
@@ -361,6 +450,7 @@ impl SilexSession {
             iso_packets: packets,
             start_frame,
             maxpacket,
+            interval: self.iso_interval(ep),
             total_length,
             sel: Some(((self.dev_index as u16) << 8) | ep as u16),
             tag: REQUEST_TAG,
@@ -368,7 +458,7 @@ impl SilexSession {
         }
     }
 
-    fn build_iso_out_frame(&self, endpoint: u8, packets: Vec<(u32, u32)>, audio: Vec<u8>,
+    pub fn build_iso_out_frame(&self, endpoint: u8, packets: Vec<(u32, u32)>, audio: Vec<u8>,
                            start_frame: u32, maxpacket: u16, nch: Option<u8>) -> SilexFrame {
         let ep = endpoint & 0x7F; // OUT: no 0x80 bit
         let mut req = SilexFrame {
@@ -379,6 +469,7 @@ impl SilexSession {
             iso_packets: packets.clone(),
             start_frame,
             maxpacket,
+            interval: self.iso_interval(ep),
             data: audio.clone(),
             sel: Some(((self.dev_index as u16) << 8) | ep as u16),
             tag: REQUEST_TAG,
@@ -432,14 +523,14 @@ impl SilexSession {
     pub async fn iso_send(&self, ep: u8, packets: Vec<(u32, u32)>, start_frame: u32,
                           maxpacket: u16, total_length: u32) -> std::result::Result<(), TransferError> {
         let f = self.build_iso_in_frame(ep, packets, start_frame, maxpacket, total_length);
-        self.send_bytes(&f.to_bytes()).await
+        self.send_bytes(&self.encode_request(&f)).await
     }
 
     /// Send one iso-OUT (playback) request without waiting for the 12-byte ACK.
     pub async fn iso_send_out(&self, ep: u8, packets: Vec<(u32, u32)>, audio: Vec<u8>,
                               start_frame: u32, maxpacket: u16, nch: Option<u8>) -> std::result::Result<(), TransferError> {
         let f = self.build_iso_out_frame(ep, packets, audio, start_frame, maxpacket, nch);
-        self.send_bytes(&f.to_bytes()).await
+        self.send_bytes(&self.encode_request(&f)).await
     }
 
     /// Read one iso response (FIFO to the send order).
@@ -455,7 +546,7 @@ impl SilexSession {
         let frames: Vec<Vec<u8>> = requests
             .iter()
             .map(|(ep, packets, sf, mp, tl)| {
-                self.build_iso_in_frame(*ep, packets.clone(), *sf, *mp, *tl).to_bytes()
+                self.encode_request(&self.build_iso_in_frame(*ep, packets.clone(), *sf, *mp, *tl))
             })
             .collect();
         let _g = self.io_lock.lock().await;
@@ -478,8 +569,23 @@ impl SilexSession {
     /// the mux worker (exactly one sender task per connection).
     pub async fn send_request(&self, frame: SilexFrame) -> std::result::Result<u16, TransferError> {
         let seq = frame.seq;
-        self.send_bytes(&frame.to_bytes()).await?;
+        self.send_bytes(&self.encode_request(&frame)).await?;
         Ok(seq)
+    }
+
+    /// Cancel a DS-600 URB using its original tunnel sequence and endpoint.
+    /// The server suppresses the cancelled completion; no reply is expected.
+    pub async fn cancel_request(&self, mut frame: SilexFrame) -> std::result::Result<(), TransferError> {
+        if !self.dev_id.starts_with("usb") { return Ok(()); }
+        frame.opcode |= 0x4000;
+        let header_len = match frame.transfer_type() {
+            crate::protocol::silex_frame::TransferType::Control => 22,
+            crate::protocol::silex_frame::TransferType::Isochronous => 24,
+            _ => 18,
+        };
+        let mut bytes = self.encode_request(&frame);
+        bytes.truncate(header_len);
+        self.send_bytes(&bytes).await
     }
 
     /// Read one response (blocking). For the mux reader (exactly one reader task); the
@@ -521,6 +627,15 @@ impl SilexSession {
         self.iso_out_format.lock().unwrap().is_some()
     }
 
+    pub fn set_endpoint_config(&self, config: &[u8]) {
+        *self.endpoint_params.lock().unwrap() = super::device::parse_endpoint_params(config);
+        *self.iso_out_format.lock().unwrap() = Some(parse_iso_out_formats(config));
+    }
+
+    fn iso_interval(&self, endpoint: u8) -> u16 {
+        self.endpoint_params.lock().unwrap().get(&endpoint).map(|p| p.1).unwrap_or(1)
+    }
+
     /// Load+parse the config descriptor and fill the iso-OUT format map. Call only on
     /// the connection's own (idle) session BEFORE iso requests are in flight, otherwise
     /// the control response would desync the iso stream.
@@ -548,6 +663,21 @@ fn now_millis() -> u32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u32)
         .unwrap_or(1)
+}
+
+/// DS-600 status 0x0002 means another bulk segment follows with the same
+/// sequence. Other transfers may complete between segments on a mux connection.
+fn assemble_bulk_response(pending: &mut HashMap<(u16, u16), Vec<u8>>, frame: &mut SilexFrame) -> bool {
+    let key = (frame.opcode, frame.seq);
+    if frame.status1 == 2 {
+        pending.entry(key).or_default().append(&mut frame.data);
+        return false;
+    }
+    if let Some(mut data) = pending.remove(&key) {
+        data.append(&mut frame.data);
+        frame.data = data;
+    }
+    true
 }
 
 /// `read_exact` with an optional timeout; maps outcomes to [`TransferError`].
@@ -660,6 +790,109 @@ pub fn parse_iso_out_formats(cfg: &[u8]) -> HashMap<u8, (u16, u8, u8)> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn ds600_cancel_keeps_sequence_endpoint_and_omits_out_payload() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut remote, _) = listener.accept().await.unwrap();
+        let session = SilexSession::new("127.0.0.1", [0; 6], "usb1-002:0", None, 19540, Duration::ZERO);
+        let (_, write) = client.into_split();
+        *session.write.lock().await = Some(write);
+        let mut request = session.build_bulk_frame(2, false, 7, vec![0xAB; 7]);
+        request.seq = 0x1234;
+        session.cancel_request(request).await.unwrap();
+        let mut packet = [0; 18];
+        remote.read_exact(&mut packet).await.unwrap();
+        assert_eq!(&packet[..10], &[0xC0, 3, 0x12, 0x34, 0, 1, 2, 2, 2, 5]);
+        assert!(timeout(Duration::from_millis(30), remote.read_u8()).await.is_err());
+    }
+
+    #[test]
+    fn ds600_bulk_segments_are_one_completion_even_when_interleaved() {
+        let mut pending = HashMap::new();
+        let mut segment = SilexFrame { opcode: 3, seq: 207, status1: 2,
+            data: vec![0x11; 20480], ..Default::default() };
+        assert!(!assemble_bulk_response(&mut pending, &mut segment));
+        let mut other = SilexFrame { opcode: 3, seq: 208, data: vec![0x55; 13], ..Default::default() };
+        assert!(assemble_bulk_response(&mut pending, &mut other));
+        assert_eq!(other.data.len(), 13);
+        segment.data = vec![0x22; 20480];
+        assert!(!assemble_bulk_response(&mut pending, &mut segment));
+        segment.status1 = 0;
+        segment.data = vec![0x33; 20480];
+        assert!(assemble_bulk_response(&mut pending, &mut segment));
+        assert_eq!(segment.data.len(), 61440);
+        assert_eq!((segment.data[0], segment.data[20480], segment.data[40960]), (0x11, 0x22, 0x33));
+        assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_tcp_connect_releases_udp_reservation() {
+        // Hold a non-listening TCP socket so TCP connections are refused while
+        // a mock control service can still bind the same port over UDP.
+        let closed_tcp = tokio::net::TcpSocket::new_v4().unwrap();
+        closed_tcp.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = closed_tcp.local_addr().unwrap();
+        let udp = UdpSocket::bind(addr).await.unwrap();
+        let mock = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let mut query_peer = None;
+            for (command, phase) in [
+                (ud::CMD_CONNECT, Phase::Query),
+                (ud::CMD_CONNECT, Phase::Commit),
+                (ud::CMD_DISCONNECT, Phase::Query),
+                (ud::CMD_DISCONNECT, Phase::Commit),
+            ] {
+                let (n, peer) = udp.recv_from(&mut buf).await.unwrap();
+                match ud::parse(&buf[..n]).unwrap() {
+                    Message::Command(request) => {
+                        assert_eq!(request.command, command);
+                        assert_eq!(request.phase, phase);
+                        assert_eq!(request.dev_id.as_deref(), Some("dev01"));
+                        if phase == Phase::Query {
+                            query_peer = Some(peer);
+                        } else {
+                            assert_eq!(Some(peer), query_peer);
+                            assert_eq!(request.op_code, 3);
+                        }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                }
+                let response: &[u8] = if phase == Phase::Query {
+                    b"\x00\x01\x00\x00\x00\x00\x00\x03OK\x00"
+                } else {
+                    b"\x00\x03\x00\x00\x00\x00\x00\x00"
+                };
+                udp.send_to(response, peer).await.unwrap();
+            }
+        });
+        let session = SilexSession::new("127.0.0.1", [0; 6], "dev01",
+            Some("127.0.0.1".into()), addr.port(), Duration::ZERO);
+        assert!(session.connect_with(0, Duration::ZERO).await.is_err());
+        timeout(Duration::from_secs(1), mock).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn denied_connection_is_committed_without_release_or_retry() {
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = udp.local_addr().unwrap();
+        let mock = tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            let (_, peer) = udp.recv_from(&mut buf).await.unwrap();
+            udp.send_to(b"\x00\x01\x00\x00\x00\x00\x00\x05DENY\x00", peer).await.unwrap();
+            let (n, commit_peer) = udp.recv_from(&mut buf).await.unwrap();
+            assert_eq!(peer, commit_peer);
+            assert_eq!(&buf[..4], &[0, 3, 0, 1]);
+            assert_eq!(crate::wire::rd_u16(&buf[..n], 84), 5);
+            udp.send_to(b"\x00\x03\x00\x00\x00\x00\x00\x00", peer).await.unwrap();
+            assert!(timeout(Duration::from_millis(100), udp.recv_from(&mut buf)).await.is_err());
+        });
+        let session = SilexSession::new("127.0.0.1", [0; 6], "usb1-002:0",
+            Some("127.0.0.1".into()), addr.port(), Duration::ZERO);
+        assert!(session.connect().await.unwrap_err().to_string().contains("USB port connection password"));
+        timeout(Duration::from_secs(1), mock).await.unwrap().unwrap();
+    }
+
     #[test]
     fn dev_index_from_dev_id() {
         let s = SilexSession::new("192.0.2.1", [0; 6], "dev02", Some("192.0.2.9".into()), ud::PORT, Duration::ZERO);
@@ -679,6 +912,23 @@ mod tests {
         let b = s.alloc_iso_frames(8);
         assert_eq!(b, a.wrapping_add(8));
         assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn iso_frames_use_configured_endpoint_interval_in_both_directions() {
+        let s = SilexSession::new("192.0.2.1", [0; 6], "usb5-005:0", None, ud::PORT, Duration::ZERO);
+        s.set_endpoint_config(&[
+            9, 4, 3, 1, 1, 1, 2, 0x20, 0,
+            7, 5, 9, 0x0d, 193, 0, 4,
+            9, 4, 4, 1, 1, 1, 2, 0x20, 0,
+            7, 5, 0x81, 5, 197, 0, 4,
+        ]);
+        let input = s.build_iso_in_frame(1, vec![(0, 196)], 0x12345678, 0x80c5, 208);
+        let output = s.build_iso_out_frame(9, vec![(0, 192)], vec![0; 192], 0x12345678, 0x80c1, None);
+        for frame in [input, output] {
+            assert_eq!(frame.interval, 4);
+            assert_eq!(&s.encode_request(&frame)[12..16], &[0, 4, 0, 0]);
+        }
     }
 
     #[test]

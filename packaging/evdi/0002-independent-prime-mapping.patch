@@ -1,0 +1,58 @@
+Subject: [PATCH] Keep PRIME vmap storage separate from the painter mapping
+SPDX-License-Identifier: GPL-2.0-only
+
+Based on DisplayLink/evdi PR 604 by Kieran (TigerWolf).
+Do not overwrite obj->vmapping when another importer maps an exported
+object: the painter may already have its own mapping of these pages.
+Each PRIME mapping balances its own page pin and unmaps the returned address.
+
+--- a/evdi_gem.c
++++ b/evdi_gem.c
+@@ -63,22 +63,23 @@
+ {
+ 	struct evdi_gem_object *obj = to_evdi_bo(gem);
+ 	int page_count = DIV_ROUND_UP(gem->size, PAGE_SIZE);
++	void *mapping;
+ 	int ret;
+ 
+ 	ret = evdi_pin_pages(obj);
+ 	if (ret)
+ 		return ret;
+ 
+-	obj->vmapping = vmap(obj->pages, page_count, 0, PAGE_KERNEL);
+-	if (!obj->vmapping) {
++	mapping = vmap(obj->pages, page_count, 0, PAGE_KERNEL);
++	if (!mapping) {
+ 		evdi_unpin_pages(obj);
+ 		return -ENOMEM;
+ 	}
+ 
+ #ifdef EVDI_HAVE_IOSYS_MAP
+-	iosys_map_set_vaddr(map, obj->vmapping);
+-#else
+-	dma_buf_map_set_vaddr(map, obj->vmapping);
++	iosys_map_set_vaddr(map, mapping);
++#else
++	dma_buf_map_set_vaddr(map, mapping);
+ #endif
+ 
+ 	return 0;
+@@ -93,10 +94,15 @@
+ {
+ 	struct evdi_gem_object *obj = to_evdi_bo(gem);
+ 
+-	if (obj->vmapping) {
+-		vunmap(obj->vmapping);
+-		obj->vmapping = NULL;
++	/* PRIME mappings are independent of the painter's cached mapping. */
++	if (map->vaddr) {
++		vunmap(map->vaddr);
+ 		evdi_unpin_pages(obj);
++#ifdef EVDI_HAVE_IOSYS_MAP
++		iosys_map_clear(map);
++#else
++		dma_buf_map_clear(map);
++#endif
+ 	}
+ }
+ 

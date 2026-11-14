@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Result};
@@ -25,6 +26,7 @@ use crate::usbip_control::{UsbipControl, UsbipOps};
 pub const STATUS_AVAILABLE: &str = "available";
 pub const STATUS_CONNECTED: &str = "connected";
 pub const STATUS_IN_USE: &str = "in_use";
+pub const STATUS_RECONNECTING: &str = "reconnecting";
 
 const REQUEST_ACK_TIMEOUT: Duration = Duration::from_secs(8);
 const REQUEST_RESULT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -39,6 +41,10 @@ pub fn device_key(d: &ud::UsbDeviceEntry) -> String {
     format!("{:04x}:{:04x}:{}", d.id_vendor, d.id_product, d.description)
 }
 
+fn device_identity(d: &ud::UsbDeviceEntry) -> String {
+    format!("{}:{}", device_key(d), d.tag_base())
+}
+
 #[derive(Clone)]
 struct Connection {
     server_mac: String,
@@ -46,6 +52,7 @@ struct Connection {
     busid: String,
     port: Option<i32>,
     description: String, // for notices when the device disappears
+    entry: ud::UsbDeviceEntry,
 }
 
 struct Outgoing {
@@ -79,11 +86,17 @@ pub struct Daemon {
     usbip_server: Mutex<Option<Arc<UsbipServer>>>,
     recently_released: Mutex<HashMap<Key, Instant>>,
     autoconnect_pending: Mutex<HashSet<Key>>,
-    reconnecting: Mutex<HashSet<Key>>,
+    manual_disconnects: Mutex<HashSet<Key>>,
+    reconnecting: Mutex<HashMap<Key, Connection>>,
+    startup_done: Mutex<HashSet<Key>>, // (server MAC, stable device identity)
+    export_identities: Mutex<HashMap<String, String>>,
     pending_requests: Mutex<HashMap<Key, (SocketAddr, PeerMessage)>>,
     grace_timers: Mutex<HashMap<Key, GraceTimer>>,
     outgoing: Mutex<HashMap<Key, Outgoing>>,
     connect_lock: tokio::sync::Mutex<()>,
+    shutting_down: AtomicBool,
+    export_mac: Mutex<Option<String>>,
+    export_task: Mutex<Option<JoinHandle<()>>>,
 }
 
 fn local_user() -> String {
@@ -126,11 +139,17 @@ impl Daemon {
             usbip_server: Mutex::new(None),
             recently_released: Mutex::new(HashMap::new()),
             autoconnect_pending: Mutex::new(HashSet::new()),
-            reconnecting: Mutex::new(HashSet::new()),
+            manual_disconnects: Mutex::new(HashSet::new()),
+            reconnecting: Mutex::new(HashMap::new()),
+            startup_done: Mutex::new(HashSet::new()),
+            export_identities: Mutex::new(HashMap::new()),
             pending_requests: Mutex::new(HashMap::new()),
             grace_timers: Mutex::new(HashMap::new()),
             outgoing: Mutex::new(HashMap::new()),
             connect_lock: tokio::sync::Mutex::new(()),
+            shutting_down: AtomicBool::new(false),
+            export_mac: Mutex::new(None),
+            export_task: Mutex::new(None),
         })
     }
 
@@ -188,6 +207,41 @@ impl Daemon {
         tokio::spawn(async move { me.reconnect_loop().await });
 
         server.serve().await
+    }
+
+    pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let _guard = self.connect_lock.lock().await;
+        let connections: Vec<_> = self.connections.lock().unwrap().drain().map(|(_, c)| c).collect();
+        for conn in connections {
+            if let Some(port) = conn.port {
+                let usbip = self.usbip.clone();
+                match tokio::task::spawn_blocking(move || usbip.detach(port)).await {
+                    Ok(Ok(())) => {},
+                    result => tracing::error!(port, ?result, "USB/IP detach during shutdown failed"),
+                }
+            }
+        }
+        self.clear_export().await;
+    }
+
+    async fn clear_export(&self) {
+        let server = self.usbip_server.lock().unwrap().take();
+        if let Some(server) = server { server.shutdown().await; }
+        let task = self.export_task.lock().unwrap().take();
+        if let Some(task) = task {
+            task.abort();
+            let _ = task.await;
+        }
+        self.busids.lock().unwrap().clear();
+        self.export_identities.lock().unwrap().clear();
+        *self.export_mac.lock().unwrap() = None;
+    }
+
+    async fn clear_idle_export(&self) {
+        if self.connections.lock().unwrap().is_empty() && self.reconnecting.lock().unwrap().is_empty() {
+            self.clear_export().await;
+        }
     }
 
     // -- broadcast helpers ------------------------------------------------- //
@@ -323,6 +377,12 @@ impl Daemon {
                 .cloned()
                 .collect();
             for ip in stale {
+                let mac = servers.get(&ip).map(DeviceServer::mac_str).unwrap_or_default();
+                if self.connections.lock().unwrap().values().any(|c| c.server_mac == mac)
+                    || self.reconnecting.lock().unwrap().values().any(|c| c.server_mac == mac) {
+                    changed = true;
+                    continue;
+                }
                 servers.remove(&ip);
                 last.remove(&ip);
                 changed = true;
@@ -409,6 +469,9 @@ impl Daemon {
         let settings = self.store.get();
         let rule = settings.rule_for(&srv.mac_str(), &key);
         let owner_ip = d.owner_ip();
+        let recovering = self.reconnecting.lock().unwrap().values().any(|c|
+            c.server_mac == srv.mac_str() && device_identity(&c.entry) == device_identity(d.primary()));
+        let active = self.connections.lock().unwrap().contains_key(&(srv.mac_str(), d.dev_id().to_string()));
         json!({
             "dev_id": d.dev_id(),
             "description": d.description().trim(),
@@ -422,14 +485,26 @@ impl Daemon {
             "type": d.device_type(),
             "usb_class": d.representative_class(),
             "composite": d.is_composite(),
+            "password_required": d.primary().password_required(),
+            "auto_connect": settings.should_auto_connect(&srv.mac_str(), &key),
+            "reconnect_on_error": rule.map(|r| r.reconnect_on_error).unwrap_or(true),
             "key": key,
-            "status": self.device_status(srv, d.dev_id(), &owner_ip),
+            "status": if recovering && !active { STATUS_RECONNECTING } else { self.device_status(srv, d.dev_id(), &owner_ip) },
             "owner_ip": owner_ip,
             "owner_host": self.owner_host(&owner_ip),
         })
     }
 
     fn snapshot_server(self: &Arc<Self>, srv: &DeviceServer) -> Value {
+        let mut srv = srv.clone();
+        let pending: Vec<_> = self.reconnecting.lock().unwrap().values()
+            .filter(|c| c.server_mac == srv.mac_str()).cloned().collect();
+        for connection in pending {
+            if !srv.devices.iter().any(|d| device_identity(d) == device_identity(&connection.entry)) {
+                srv.devices.push(connection.entry);
+            }
+        }
+        let srv = &srv;
         let ipv6 = if srv.mac.len() == 6 { ud::mac_to_link_local(&srv.mac) } else { String::new() };
         // Composite devices (multiple interfaces) are collapsed into ONE row like SX
         // Virtual Link; the representative class drives type + icon.
@@ -441,6 +516,7 @@ impl Daemon {
             "model": srv.model,
             "version": srv.version,
             "hostname": srv.hostname,
+            "bind_all": self.store.get().bind_all_servers.contains(&srv.mac_str()),
             "ipv6": ipv6,
             "devices": devices,
         })
@@ -453,12 +529,53 @@ impl Daemon {
     }
 
     // -- IPC dispatch ------------------------------------------------------ //
+    async fn enable_system_service() -> Result<()> {
+        if std::env::var_os("SILEX_SYSTEM_SERVICE").is_some() {
+            tokio::task::spawn_blocking(|| -> Result<()> {
+                let output = std::process::Command::new("/usr/bin/systemctl")
+                    .args(["enable", "opensilexlink.service"]).output()?;
+                if !output.status.success() {
+                    bail!("Cannot enable connection before login: {}", String::from_utf8_lossy(&output.stderr).trim());
+                }
+                Ok(())
+            }).await??;
+        }
+        Ok(())
+    }
+
+    async fn set_bind_all(self: &Arc<Self>, mac: &str, enabled: bool) -> Result<Value> {
+        if enabled {
+            self.find_server_by_mac(mac).ok_or_else(|| anyhow::anyhow!("device server {mac} not found"))?;
+            Self::enable_system_service().await?;
+        }
+        let was_enabled = self.store.get().bind_all_servers.iter().any(|m| m == mac);
+        let settings = self.store.set_bind_all(mac, enabled)?;
+        if enabled && !was_enabled {
+            // Explicitly enabling the server-wide policy is a new Connect action.
+            self.manual_disconnects.lock().unwrap().retain(|(m, _)| m != mac);
+            self.startup_done.lock().unwrap().retain(|(m, _)| m != mac);
+        }
+        self.broadcast("settings", settings.to_value());
+        self.broadcast_servers();
+        self.maybe_autoconnect();
+        Ok(json!({"bind_all": enabled}))
+    }
+
     async fn handle(self: Arc<Self>, method: String, params: Value, peer: Arc<Peer>) -> Result<Value> {
         let sp = |k: &str| -> Result<String> {
             params.get(k).and_then(Value::as_str).map(str::to_string).ok_or_else(|| anyhow::anyhow!("missing parameter {k:?}"))
         };
         match method.as_str() {
-            "hello" => Ok(json!({"name": "silex-daemon", "version": 1})),
+            "hello" => Ok(json!({"name": "silex-daemon", "version": 1, "app_version": env!("CARGO_PKG_VERSION"),
+                "system_service": std::env::var_os("SILEX_SYSTEM_SERVICE").is_some()})),
+            "prepare_shutdown" => {
+                let _guard = self.connect_lock.lock().await;
+                let connections: Vec<_> = self.connections.lock().unwrap().values().cloned().collect();
+                for conn in connections {
+                    if let Some(port) = conn.port { self.usbip.ensure_detachable(port)?; }
+                }
+                Ok(json!({"ready": true}))
+            }
             "list_servers" => Ok(self.servers_snapshot()),
             "subscribe" => {
                 peer.subscribe();
@@ -473,8 +590,14 @@ impl Daemon {
             "set_settings" => {
                 let s = self.store.update(params.clone())?;
                 self.broadcast("settings", s.to_value());
+                self.broadcast_servers();
                 self.maybe_autoconnect();
                 Ok(s.to_value())
+            }
+            "set_bind_all" => {
+                let enabled = params.get("enabled").and_then(Value::as_bool)
+                    .ok_or_else(|| anyhow::anyhow!("missing boolean parameter enabled"))?;
+                self.set_bind_all(&sp("mac")?, enabled).await
             }
             "set_device_rule" => {
                 let mac = sp("mac")?;
@@ -487,8 +610,29 @@ impl Daemon {
                         }
                     }
                 }
+                if updates.get("auto_connect").and_then(Value::as_bool) == Some(true) {
+                    Self::enable_system_service().await?;
+                }
+                let was_auto_connect = self.store.get().should_auto_connect(&mac, &key);
                 let s = self.store.set_device_rule(&mac, &key, &updates)?;
+                if updates.get("reconnect_on_error").and_then(Value::as_bool) == Some(false) {
+                    self.reconnecting.lock().unwrap().retain(|_, c|
+                        c.server_mac != mac || device_key(&c.entry) != key);
+                }
+                if updates.get("auto_connect").and_then(Value::as_bool) == Some(true) && !was_auto_connect {
+                    if let Some(server) = self.find_server_by_mac(&mac) {
+                        for device in &server.devices {
+                            if device_key(device) == key {
+                                self.manual_disconnects.lock().unwrap().remove(&(mac.clone(), device.dev_id.clone()));
+                                if !self.connections.lock().unwrap().contains_key(&(mac.clone(), device.dev_id.clone())) {
+                                    self.startup_done.lock().unwrap().remove(&(mac.clone(), device_identity(device)));
+                                }
+                            }
+                        }
+                    }
+                }
                 self.broadcast("settings", s.to_value());
+                self.broadcast_servers();
                 self.maybe_autoconnect();
                 Ok(s.to_value())
             }
@@ -517,10 +661,15 @@ impl Daemon {
                 if !matches!(d.interface_index(), None | Some(0)) {
                     continue;
                 }
-                if !d.owner_ip.is_empty() {
+                if !d.owner_ip.is_empty() || d.password_required() {
                     continue;
                 }
                 let key = (mac.clone(), d.dev_id.clone());
+                if self.manual_disconnects.lock().unwrap().contains(&key)
+                    || self.startup_done.lock().unwrap().contains(&(mac.clone(), device_identity(d)))
+                    || self.reconnecting.lock().unwrap().values().any(|c| c.server_mac == mac && device_identity(&c.entry) == device_identity(d)) {
+                    continue;
+                }
                 if self.connections.lock().unwrap().contains_key(&key) {
                     continue;
                 }
@@ -537,7 +686,7 @@ impl Daemon {
                 let me = self.clone();
                 let (m, dev) = key.clone();
                 tokio::spawn(async move {
-                    let _ = me.connect(&m, &dev).await;
+                    let _ = me.connect_inner(&m, &dev, true).await;
                     me.autoconnect_pending.lock().unwrap().remove(&(m, dev));
                 });
             }
@@ -546,24 +695,32 @@ impl Daemon {
 
     // -- connect / disconnect ---------------------------------------------- //
     async fn ensure_export(self: &Arc<Self>, srv: &DeviceServer) -> Result<()> {
-        {
-            let mut b = self.busids.lock().unwrap();
-            if b.is_empty() {
-                // One busid per LOGICAL device (a composite = one entry, the primary
-                // dev_id). SilexDevice connects the sub-interfaces itself on import -> they
-                // must NOT be separately attachable (double reservation otherwise).
-                for (i, d) in ud::logical_devices(&srv.devices).iter().enumerate() {
-                    b.insert(d.primary().dev_id.clone(), format!("1-{}", i + 1));
-                }
+        self.clear_idle_export().await;
+        if let Some(mac) = self.export_mac.lock().unwrap().as_ref() {
+            if mac != &srv.mac_str() {
+                bail!("Only one device server can be connected at a time. Disconnect its devices first.");
             }
         }
+        let devices = {
+            let mut identities = self.export_identities.lock().unwrap();
+            let mut busids = self.busids.lock().unwrap();
+            busids.clear();
+            let mut devices = Vec::new();
+            for device in ud::logical_devices(&srv.devices) {
+                let identity = device_identity(device.primary());
+                let next = format!("1-{}", identities.len() + 1);
+                let busid = identities.entry(identity).or_insert(next).clone();
+                let dev_id = device.dev_id().to_string();
+                busids.insert(dev_id.clone(), busid.clone());
+                devices.push((busid, dev_id));
+            }
+            devices
+        };
+        let existing = self.usbip_server.lock().unwrap().clone();
+        if let Some(server) = existing {
+            server.update_devices(devices.clone(), &srv.devices);
+        }
         if self.start_usbip_server && self.usbip_server.lock().unwrap().is_none() {
-            let busids = self.busids.lock().unwrap().clone();
-            let devices: Vec<(String, String)> = srv
-                .devices
-                .iter()
-                .filter_map(|d| busids.get(&d.dev_id).map(|b| (b.clone(), d.dev_id.clone())))
-                .collect();
             let server = Arc::new(UsbipServer::new(
                 &srv.ip,
                 mac_array(&srv.mac)?,
@@ -571,27 +728,40 @@ impl Daemon {
                 ("127.0.0.1".to_string(), TCP_PORT),
                 ud::PORT,
                 devices,
-            ));
+            ).with_device_speeds(&srv.devices));
             server.bind().await?;
             let s = server.clone();
-            tokio::spawn(async move {
+            let task = tokio::spawn(async move {
                 let _ = s.serve().await;
             });
+            *self.export_task.lock().unwrap() = Some(task);
             *self.usbip_server.lock().unwrap() = Some(server);
         }
+        *self.export_mac.lock().unwrap() = Some(srv.mac_str());
         Ok(())
     }
 
     async fn connect(self: &Arc<Self>, mac: &str, dev_id: &str) -> Result<Value> {
+        self.connect_inner(mac, dev_id, false).await
+    }
+
+    async fn connect_inner(self: &Arc<Self>, mac: &str, dev_id: &str, automatic: bool) -> Result<Value> {
         self.cancel_grace_timer(mac, dev_id);
         let _guard = self.connect_lock.lock().await;
-        let srv = self.find_server_by_mac(mac).ok_or_else(|| anyhow::anyhow!("device server {mac} not found"))?;
-        if !srv.devices.iter().any(|d| d.dev_id == dev_id) {
-            bail!("{dev_id} not present at {mac}");
+        if self.shutting_down.load(Ordering::SeqCst) { bail!("daemon is shutting down"); }
+        if automatic && self.manual_disconnects.lock().unwrap().contains(&(mac.to_string(), dev_id.to_string())) {
+            bail!("automatic connection suppressed after manual disconnect");
         }
+        let srv = self.find_server_by_mac(mac).ok_or_else(|| anyhow::anyhow!("device server {mac} not found"))?;
+        let logical = ud::logical_devices(&srv.devices);
+        let device = logical.iter().find(|d| d.dev_id() == dev_id)
+            .ok_or_else(|| anyhow::anyhow!("{dev_id} is not a primary USB device at {mac}"))?;
         let key = (mac.to_string(), dev_id.to_string());
         if let Some(c) = self.connections.lock().unwrap().get(&key) {
             return Ok(json!({"connected": true, "busid": c.busid, "port": c.port}));
+        }
+        if device.primary().password_required() {
+            bail!("USB port password protection is enabled. Configure this test port without a connection password, or use connect --password-file for a headless connection.");
         }
         self.ensure_export(&srv).await?;
         let busid = self
@@ -601,13 +771,23 @@ impl Daemon {
             .get(dev_id)
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("no busid for {dev_id}"))?;
-        self.usbip.ensure_module()?;
-        let before = self.usbip.used_ports();
-        self.usbip.attach(&busid)?;
+        // usbip attach waits for this same runtime's exporter to answer. Running
+        // the command on an async worker can strand that freshly spawned task
+        // in its local queue and deadlock the entire attach.
+        let usbip = self.usbip.clone();
+        let attach_busid = busid.clone();
+        let before = tokio::task::spawn_blocking(move || -> Result<_> {
+            usbip.ensure_module()?;
+            let before = usbip.used_ports();
+            usbip.attach(&attach_busid)?;
+            Ok(before)
+        }).await??;
         // The new vhci port may appear in `usbip port` shortly after attach.
         let mut port = None;
         for _ in 0..20 {
-            let new: Vec<i32> = self.usbip.used_ports().difference(&before).copied().collect();
+            let usbip = self.usbip.clone();
+            let used = tokio::task::spawn_blocking(move || usbip.used_ports()).await?;
+            let new: Vec<i32> = used.difference(&before).copied().collect();
             if let Some(&p) = new.iter().min() {
                 port = Some(p);
                 break;
@@ -622,24 +802,39 @@ impl Daemon {
             .unwrap_or_else(|| dev_id.to_string());
         self.connections.lock().unwrap().insert(
             key.clone(),
-            Connection { server_mac: mac.to_string(), dev_id: dev_id.to_string(), busid: busid.clone(), port, description: desc },
+            Connection { server_mac: mac.to_string(), dev_id: dev_id.to_string(), busid: busid.clone(), port, description: desc, entry: device.primary().clone() },
         );
+        self.startup_done.lock().unwrap().insert((mac.to_string(), device_identity(device.primary())));
         self.recently_released.lock().unwrap().remove(&key);
+        self.manual_disconnects.lock().unwrap().remove(&key);
         drop(_guard);
         self.broadcast_servers();
         Ok(json!({"connected": true, "busid": busid, "port": port}))
     }
 
     async fn disconnect(self: &Arc<Self>, mac: &str, dev_id: &str) -> Result<Value> {
+        let _guard = self.connect_lock.lock().await;
         let key = (mac.to_string(), dev_id.to_string());
-        let conn = self.connections.lock().unwrap().remove(&key);
+        let conn = self.connections.lock().unwrap().get(&key).cloned();
         let conn = match conn {
             Some(c) => c,
-            None => return Ok(json!({"disconnected": true, "note": "was not connected"})),
+            None => {
+                self.cancel_reconnect(mac, dev_id);
+                self.clear_idle_export().await;
+                self.broadcast_servers();
+                return Ok(json!({"disconnected": true, "note": "reconnection cancelled"}));
+            },
         };
         if let Some(port) = conn.port {
-            self.usbip.detach(port)?;
+            let usbip = self.usbip.clone();
+            tokio::task::spawn_blocking(move || -> Result<()> {
+                usbip.ensure_detachable(port)?;
+                usbip.detach(port)
+            }).await??;
         }
+        self.connections.lock().unwrap().remove(&key);
+        self.cancel_reconnect(mac, dev_id);
+        self.clear_idle_export().await;
         self.recently_released.lock().unwrap().insert(key.clone(), Instant::now());
         self.broadcast_servers();
         let me = self.clone();
@@ -690,8 +885,8 @@ impl Daemon {
 
     /// Detach vhci devices whose USB device disappeared at the server. Counterpart to
     /// `check_connections`: there the vhci *port* vanishes (tunnel dead -> reconnect); here
-    /// the port stays but the *device* is gone from discovery -> reconnect is pointless, so
-    /// clean up the port and drop the connection (no reconnect).
+    /// the device is absent from discovery. Detach the phantom port and queue
+    /// recovery when enabled, so a physical replug is also recovered.
     fn prune_phantoms(self: &Arc<Self>) {
         let conns: Vec<Connection> = self.connections.lock().unwrap().values().cloned().collect();
         for c in conns {
@@ -720,6 +915,7 @@ impl Daemon {
         let desc = if conn.description.is_empty() { conn.dev_id.clone() } else { conn.description.clone() };
         self.broadcast_servers();
         self.notice(&conn.server_mac, &conn.dev_id, &desc, "removed", "device");
+        self.queue_reconnect(conn);
     }
 
     fn check_connections(self: &Arc<Self>) {
@@ -747,71 +943,88 @@ impl Daemon {
     fn handle_tunnel_lost(self: &Arc<Self>, conn: Connection) {
         let key = (conn.server_mac.clone(), conn.dev_id.clone());
         {
-            let mut conns = self.connections.lock().unwrap();
-            match conns.get(&key) {
-                Some(c) if c.port == conn.port => {}
-                _ => return, // replaced/removed meanwhile
-            }
-            conns.remove(&key);
+            let mut connections = self.connections.lock().unwrap();
+            if connections.get(&key).map(|c| c.port) != Some(conn.port) { return; }
+            connections.remove(&key);
+        }
+        self.queue_reconnect(conn);
+    }
+
+    fn reconnect_enabled(&self, conn: &Connection) -> bool {
+        self.store.get().rule_for(&conn.server_mac, &device_key(&conn.entry))
+            .map(|r| r.reconnect_on_error).unwrap_or(true)
+    }
+
+    fn queue_reconnect(self: &Arc<Self>, conn: Connection) {
+        let key = (conn.server_mac.clone(), conn.dev_id.clone());
+        if self.shutting_down.load(Ordering::SeqCst) || !self.reconnect_enabled(&conn)
+            || self.manual_disconnects.lock().unwrap().contains(&key) {
+            self.notice(&conn.server_mac, &conn.dev_id, &conn.description, "disconnected", "reconnect");
+            self.broadcast_servers();
+            return;
         }
         {
-            let mut rec = self.reconnecting.lock().unwrap();
-            if rec.contains(&key) {
-                return;
-            }
-            rec.insert(key.clone());
+            let mut pending = self.reconnecting.lock().unwrap();
+            if pending.contains_key(&key) { return; }
+            pending.insert(key, conn.clone());
         }
-        let entry = self.entry_for(&conn.server_mac, &conn.dev_id);
-        let desc = entry.map(|e| e.description.trim().to_string()).unwrap_or_else(|| conn.dev_id.clone());
+        self.notice(&conn.server_mac, &conn.dev_id, &conn.description, "lost", "reconnect");
         self.broadcast_servers();
-        if self.should_reconnect(&conn.server_mac, &conn.dev_id) {
-            self.notice(&conn.server_mac, &conn.dev_id, &desc, "lost", "reconnect");
-            let me = self.clone();
-            tokio::spawn(async move { me.reconnect_worker(conn.server_mac, conn.dev_id, desc).await });
-        } else {
-            self.reconnecting.lock().unwrap().remove(&key);
-            self.notice(&conn.server_mac, &conn.dev_id, &desc, "disconnected", "reconnect");
-        }
+        let me = self.clone();
+        tokio::spawn(async move { me.reconnect_worker(conn).await; });
     }
 
-    fn should_reconnect(&self, mac: &str, dev_id: &str) -> bool {
-        let entry = self.entry_for(mac, dev_id);
-        match entry {
-            Some(e) => {
-                let key = device_key(&e);
-                self.store.get().rule_for(mac, &key).map(|r| r.reconnect_on_error).unwrap_or(true)
-            }
-            None => true,
-        }
-    }
-
-    async fn reconnect_worker(self: Arc<Self>, mac: String, dev_id: String, desc: String) {
-        let key = (mac.clone(), dev_id.clone());
-        for ms in RECONNECT_BACKOFF_MS {
-            tokio::time::sleep(Duration::from_millis(*ms)).await;
-            let srv = self.find_server_by_mac(&mac);
-            let entry = srv.as_ref().and_then(|s| s.devices.iter().find(|d| d.dev_id == dev_id).cloned());
-            let entry = match entry {
-                Some(e) => e,
-                None => continue, // not rediscovered yet
+    async fn reconnect_worker(self: Arc<Self>, conn: Connection) {
+        let key = (conn.server_mac.clone(), conn.dev_id.clone());
+        let identity = device_identity(&conn.entry);
+        let mut attempt = 0usize;
+        loop {
+            if self.shutting_down.load(Ordering::SeqCst)
+                || !self.reconnect_enabled(&conn)
+                || self.manual_disconnects.lock().unwrap().contains(&key)
+                || !self.reconnecting.lock().unwrap().contains_key(&key) { break; }
+            let delay = RECONNECT_BACKOFF_MS[attempt.min(RECONNECT_BACKOFF_MS.len() - 1)];
+            attempt = attempt.saturating_add(1);
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            // Recheck cancellation after the wait and before reserving a device.
+            if self.shutting_down.load(Ordering::SeqCst) || !self.reconnect_enabled(&conn)
+                || self.manual_disconnects.lock().unwrap().contains(&key)
+                || !self.reconnecting.lock().unwrap().contains_key(&key) { break; }
+            self.refresh_now().await;
+            let server = match self.find_server_by_mac(&conn.server_mac) {
+                Some(server) => server,
+                None => continue,
             };
-            if !entry.owner_ip.is_empty() {
-                if let Some(s) = &srv {
-                    if entry.owner_ip != self.our_ip_for(&s.ip) {
-                        self.notice(&mac, &dev_id, &desc, "taken", "reconnect");
-                        self.reconnecting.lock().unwrap().remove(&key);
-                        return;
-                    }
-                }
+            let device = match ud::logical_devices(&server.devices).into_iter()
+                .find(|d| device_identity(d.primary()) == identity) {
+                Some(device) => device.primary().clone(),
+                None => continue,
+            };
+            if !device.owner_ip.is_empty() && device.owner_ip != self.our_ip_for(&server.ip) {
+                continue; // another host owns it; wait without disturbing that host
             }
-            if self.connect(&mac, &dev_id).await.is_ok() {
-                self.notice(&mac, &dev_id, &desc, "reconnected", "reconnect");
+            if self.connect_inner(&conn.server_mac, &device.dev_id, true).await.is_ok() {
                 self.reconnecting.lock().unwrap().remove(&key);
+                self.notice(&conn.server_mac, &device.dev_id, &conn.description, "reconnected", "reconnect");
+                self.broadcast_servers();
                 return;
             }
         }
-        self.notice(&mac, &dev_id, &desc, "failed", "reconnect");
         self.reconnecting.lock().unwrap().remove(&key);
+        self.broadcast_servers();
+    }
+
+    fn cancel_reconnect(&self, mac: &str, dev_id: &str) {
+        let identity = self.entry_for(mac, dev_id).map(|entry| device_identity(&entry));
+        let mut pending = self.reconnecting.lock().unwrap();
+        let keys: Vec<_> = pending.iter().filter(|(key, connection)| key.0 == mac &&
+            (key.1 == dev_id || identity.as_ref() == Some(&device_identity(&connection.entry))))
+            .map(|(key, _)| key.clone()).collect();
+        for key in keys {
+            pending.remove(&key);
+            self.manual_disconnects.lock().unwrap().insert(key);
+        }
+        self.manual_disconnects.lock().unwrap().insert((mac.to_string(), dev_id.to_string()));
     }
 
     // -- peer: receive side ------------------------------------------------ //
@@ -898,8 +1111,13 @@ impl Daemon {
 
     async fn accept_peer_request(self: &Arc<Self>, addr: SocketAddr, msg: PeerMessage, mac: &str, dev_id: &str) {
         self.peer_send(addr, peerproto::TYPE_ACCEPTED, &msg);
-        let _ = self.disconnect(mac, dev_id).await;
-        self.peer_send(addr, peerproto::TYPE_RELEASED, &msg);
+        match self.disconnect(mac, dev_id).await {
+            Ok(_) => self.peer_send(addr, peerproto::TYPE_RELEASED, &msg),
+            Err(error) => {
+                tracing::warn!(%error, "Cannot release USB device");
+                self.peer_send(addr, peerproto::TYPE_DENIED, &msg);
+            }
+        }
     }
 
     fn arm_grace_timer(self: &Arc<Self>, mac: &str, dev_id: &str, addr: SocketAddr, msg: PeerMessage, timeout: Duration) {

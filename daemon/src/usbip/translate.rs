@@ -93,11 +93,19 @@ fn control_setup(cmd: &UsbipCmdSubmit) -> (u8, u8, u16, u16, u16) {
     )
 }
 
-/// Build the Silex request frame for a (non-iso) URB WITHOUT sending it.
+/// Build the Silex request frame for a URB WITHOUT sending it.
 ///
 /// For the multiplex worker (control + interrupt on one connection): EP0 -> control,
 /// interrupt EP -> interrupt request (long-poll), otherwise bulk.
 pub fn build_request(session: &SilexSession, cmd: &UsbipCmdSubmit, ep_type: Option<u8>, mps: u16, interval: u16) -> SilexFrame {
+    if cmd.is_iso() {
+        if cmd.is_in() {
+            let (ep, packets, frame, maxpacket, length) = iso_request_params(session, cmd);
+            return session.build_iso_in_frame(ep, packets, frame, maxpacket, length);
+        }
+        let (ep, packets, audio, frame, maxpacket, channels) = iso_out_request_params(session, cmd);
+        return session.build_iso_out_frame(ep, packets, audio, frame, maxpacket, channels);
+    }
     let out_data = if cmd.is_in() { Vec::new() } else { cmd.transfer_buffer.clone() };
     if cmd.ep == 0 {
         let (bmrt, breq, wv, wi, wl) = control_setup(cmd);
@@ -110,9 +118,16 @@ pub fn build_request(session: &SilexSession, cmd: &UsbipCmdSubmit, ep_type: Opti
     session.build_bulk_frame(cmd.ep as u8, cmd.is_in(), cmd.transfer_buffer_length, out_data)
 }
 
-/// Build the RET_SUBMIT from an already-received (non-iso) Silex response. Shared for
-/// control/bulk/interrupt: IN -> data + actual_length, OUT -> sent length.
+/// Build RET_SUBMIT from an already-received Silex response. Iso transfers need
+/// packet descriptors; control/bulk/interrupt use the flat payload.
 pub fn fill_ret_from_response(cmd: &UsbipCmdSubmit, resp: &SilexFrame) -> UsbipRetSubmit {
+    if cmd.is_iso() {
+        return if cmd.is_in() {
+            iso_fill_ret(cmd, ret_for(cmd), resp.status1, &resp.iso_resp_packets, resp.data.clone())
+        } else {
+            iso_fill_ret_out(cmd, ret_for(cmd), resp.status1)
+        };
+    }
     let mut ret = ret_for(cmd);
     ret.status = silex_status_to_errno(resp.status1);
     if cmd.is_in() {

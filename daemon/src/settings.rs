@@ -93,6 +93,7 @@ pub struct Settings {
     pub filter_enabled: bool,
     pub filter_servers: Vec<String>,
     pub device_rules: Vec<DeviceRule>,
+    pub bind_all_servers: Vec<String>,
 }
 
 impl Default for Settings {
@@ -118,6 +119,7 @@ impl Default for Settings {
             filter_enabled: false,
             filter_servers: Vec::new(),
             device_rules: Vec::new(),
+            bind_all_servers: Vec::new(),
         }
     }
 }
@@ -142,6 +144,9 @@ impl Settings {
     }
 
     pub fn should_auto_connect(&self, server_mac: &str, key: &str) -> bool {
+        if self.bind_all_servers.iter().any(|mac| mac == server_mac) {
+            return true;
+        }
         match self.rule_for(server_mac, key) {
             Some(r) => r.auto_connect,
             None => self.auto_connect_new,
@@ -243,6 +248,16 @@ impl SettingsStore {
         Self::write_atomic(&self.path, &snapshot)?;
         Ok(snapshot)
     }
+
+    pub fn set_bind_all(&self, server_mac: &str, enabled: bool) -> Result<Settings> {
+        let mut guard = self.settings.lock().unwrap();
+        let mut snapshot = guard.clone();
+        snapshot.bind_all_servers.retain(|mac| mac != server_mac);
+        if enabled { snapshot.bind_all_servers.push(server_mac.to_string()); }
+        Self::write_atomic(&self.path, &snapshot)?;
+        *guard = snapshot.clone();
+        Ok(snapshot)
+    }
 }
 
 #[cfg(test)]
@@ -309,6 +324,13 @@ mod tests {
         assert_eq!(s.device_rules.len(), 1);
         assert!(s.device_rules[0].auto_connect);
         assert_eq!(s.device_rules[0].label, "Good stick");
+        store.set_bind_all("00:11:22:33:44:55", true).unwrap();
+        let reloaded = SettingsStore::new(Some(path.clone()));
+        assert!(reloaded.get().should_auto_connect("00:11:22:33:44:55", "a newly added device"));
+        assert!(!reloaded.get().should_auto_connect("00:11:22:33:44:66", "a newly added device"));
+        store.set_bind_all("00:11:22:33:44:55", false).unwrap();
+        assert!(store.get().bind_all_servers.is_empty());
+        assert!(store.get().device_rules[0].auto_connect);
         std::fs::remove_dir_all(&dir).ok();
     }
 }

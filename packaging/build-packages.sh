@@ -14,10 +14,13 @@ set -euo pipefail
 
 VERSION=${1:?usage: $0 <version> [<output dir>]}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
-OUT=$(realpath -m "${2:-$ROOT/dist}")
+OUT=$(realpath -m "${2:-$ROOT/dist/release}")
 PYTHON=${PYTHON:-python3}
 
 die() { echo "build-packages: $*" >&2; exit 1; }
+command -v nfpm >/dev/null || die "nfpm 2.45.0 is required"
+export QT_QPA_PLATFORM=${QT_QPA_PLATFORM:-offscreen}
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "expected a numeric x.y.z version"
 
 # ---- versions must agree ----
 cargo_ver=$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/daemon/Cargo.toml" | head -n1)
@@ -30,16 +33,35 @@ mod_ver=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$ROOT/client/src/opensilexlin
 # ---- daemon ----
 cargo test --manifest-path "$ROOT/daemon/Cargo.toml" --locked
 cargo build --manifest-path "$ROOT/daemon/Cargo.toml" --release --locked
+"$PYTHON" "$ROOT/packaging/collect-notices.py"
 
 # ---- client (tests also compile the German catalog) ----
 (cd "$ROOT/client" && "$PYTHON" -m pytest -q -p no:cacheprovider)
 "$PYTHON" "$ROOT/client/scripts/compile_translations.py"
 find "$ROOT/client/src" -name __pycache__ -type d -prune -exec rm -rf {} +
 
+# Stage the Python tree with distribution permissions, independent of umask.
+"$PYTHON" - "$ROOT" <<'PY_STAGE'
+import shutil
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+stage = root / "packaging/build/client/opensilexlink"
+if stage.exists():
+    shutil.rmtree(stage)
+shutil.copytree(root / "client/src/opensilexlink", stage)
+for entry in [stage, *stage.rglob("*")]:
+    entry.chmod(0o755 if entry.is_dir() else 0o644)
+PY_STAGE
+
 # ---- packages ----
 mkdir -p "$OUT"
 cd "$ROOT"
 export VERSION
-nfpm package -f packaging/nfpm.yaml -p deb -t "$OUT/"
-nfpm package -f packaging/nfpm.yaml -p rpm -t "$OUT/"
-ls -l "$OUT"
+DEB="opensilexlink_${VERSION}_amd64.deb"
+RPM="opensilexlink-${VERSION}-1.x86_64.rpm"
+nfpm package -f packaging/nfpm.yaml -p deb -t "$OUT/$DEB"
+nfpm package -f packaging/nfpm.yaml -p rpm -t "$OUT/$RPM"
+cp packaging/build/THIRD_PARTY_NOTICES.txt "$OUT/THIRD_PARTY_NOTICES.txt"
+(cd "$OUT" && sha256sum "$DEB" "$RPM" THIRD_PARTY_NOTICES.txt > SHA256SUMS)
+printf 'Release assets: %s/{%s,%s,THIRD_PARTY_NOTICES.txt,SHA256SUMS}\n' "$OUT" "$DEB" "$RPM"

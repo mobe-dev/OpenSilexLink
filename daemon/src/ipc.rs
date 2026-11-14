@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,7 +31,7 @@ pub fn default_socket_path() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/tmp".to_string());
+        .unwrap_or_else(|| format!("/tmp/opensilexlink-{}", std::fs::metadata("/proc/self").map(|m| m.uid()).unwrap_or(0)));
     PathBuf::from(base).join("silex-daemon.sock")
 }
 
@@ -52,7 +53,7 @@ fn encode(msg: &Value) -> Vec<u8> {
 
 /// A connected client on the server side.
 pub struct Peer {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
     subscribed: AtomicBool,
 }
 
@@ -66,11 +67,11 @@ impl Peer {
     }
 
     pub fn send_event(&self, event: &str, data: Value) {
-        let _ = self.tx.send(encode(&json!({"event": event, "data": data})));
+        let _ = self.tx.try_send(encode(&json!({"event": event, "data": data})));
     }
 
     fn send_msg(&self, v: &Value) {
-        let _ = self.tx.send(encode(v));
+        let _ = self.tx.try_send(encode(v));
     }
 }
 
@@ -113,8 +114,20 @@ impl IpcServer {
     pub async fn serve(self: Arc<Self>) -> Result<()> {
         match self.addr.clone() {
             IpcAddr::Unix(path) => {
-                let _ = std::fs::remove_file(&path);
+                if let Some(parent) = path.parent() {
+                    if !parent.exists() { std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?; }
+                }
+                if let Ok(meta) = std::fs::symlink_metadata(&path) {
+                    use std::os::unix::fs::FileTypeExt;
+                    if !meta.file_type().is_socket() { anyhow::bail!("refusing to replace non-socket {}", path.display()); }
+                    if tokio::net::UnixStream::connect(&path).await.is_ok() {
+                        anyhow::bail!("daemon already running at {}", path.display());
+                    }
+                    std::fs::remove_file(&path)?;
+                }
                 let listener = UnixListener::bind(&path)?;
+                let mode = if std::env::var_os("SILEX_SYSTEM_SERVICE").is_some() { 0o660 } else { 0o600 };
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
                 loop {
                     let (stream, _addr) = listener.accept().await?;
                     let me = self.clone();
@@ -138,7 +151,7 @@ impl IpcServer {
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
     {
         let (mut rd, mut wr) = tokio::io::split(stream);
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let peer = Arc::new(Peer { tx, subscribed: AtomicBool::new(false) });
         self.peers.lock().unwrap().insert(id, peer.clone());
@@ -152,6 +165,7 @@ impl IpcServer {
         });
 
         let mut buf: Vec<u8> = Vec::new();
+        let permits = Arc::new(tokio::sync::Semaphore::new(32));
         let mut tmp = [0u8; 65536];
         loop {
             let n = match rd.read(&mut tmp).await {
@@ -159,6 +173,7 @@ impl IpcServer {
                 Ok(n) => n,
             };
             buf.extend_from_slice(&tmp[..n]);
+            if buf.len() > 1024 * 1024 { break; }
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let line: Vec<u8> = buf.drain(..=pos).collect();
                 let trimmed = &line[..line.len() - 1];
@@ -168,9 +183,13 @@ impl IpcServer {
                 if let Ok(msg) = serde_json::from_slice::<Value>(trimmed) {
                     let me = self.clone();
                     let peer = peer.clone();
+                    let permit = match permits.clone().try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => break,
+                    };
                     // Dispatch concurrently so a slow request (e.g. connect) does not
                     // block other requests or events on the same connection.
-                    tokio::spawn(async move { me.dispatch(msg, peer).await });
+                    tokio::spawn(async move { let _permit = permit; me.dispatch(msg, peer).await });
                 }
             }
         }
@@ -255,5 +274,31 @@ mod tests {
         let ev: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
         assert_eq!(ev["event"], json!("tick"));
         assert_eq!(ev["data"], json!({"n": 1}));
+    }
+}
+
+#[cfg(test)]
+mod unix_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn a_second_daemon_cannot_unlink_a_live_socket() {
+        let path = std::env::temp_dir().join(format!("osl-ipc-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let handler: Handler = Arc::new(|_, _, _| Box::pin(async { Ok(json!({})) }));
+        let first = Arc::new(IpcServer::new(IpcAddr::Unix(path.clone()), handler.clone()));
+        let task = tokio::spawn(first.serve());
+        for _ in 0..100 {
+            if path.exists() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        let second = Arc::new(IpcServer::new(IpcAddr::Unix(path.clone()), handler));
+        assert!(second.serve().await.unwrap_err().to_string().contains("already running"));
+        assert!(tokio::net::UnixStream::connect(&path).await.is_ok());
+        task.abort();
+        let _ = task.await;
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -115,6 +115,7 @@ impl SilexDevice {
     {
         let endpoints = parse_endpoint_map(full_config_desc);
         let ep_params = parse_endpoint_params(full_config_desc);
+        primary.set_endpoint_config(full_config_desc);
         let mut ifaces: Vec<u8> = endpoints.values().map(|(ifc, _t)| *ifc).collect();
         ifaces.sort_unstable();
         ifaces.dedup();
@@ -135,6 +136,7 @@ impl SilexDevice {
                 }
                 return Err(e);
             }
+            sub.set_endpoint_config(full_config_desc);
             iface_sessions.insert(ifc, sub);
         }
 
@@ -189,13 +191,14 @@ impl SilexDevice {
         self.ep_params.get(&addr).copied().unwrap_or((8, 10))
     }
 
-    /// Connections serving at least one interrupt endpoint (run over the mux worker: the
-    /// device holds interrupt-IN as a long-poll, so control/keepalive on the same
-    /// connection must not block).
-    pub fn interrupt_sessions(&self) -> Vec<Arc<SilexSession>> {
+    /// Bulk and interrupt reads can wait for a later OUT request. DS-600 iso
+    /// capture must also allow cancellation while a read is pending. Multiplex
+    /// these so one pending read cannot block writes, control or cancellation.
+    pub fn multiplex_sessions(&self) -> Vec<Arc<SilexSession>> {
         let mut out: Vec<Arc<SilexSession>> = Vec::new();
         for (iface, ep_type) in self.endpoints.values() {
-            if *ep_type == EP_INTERRUPT {
+            if *ep_type == EP_INTERRUPT || *ep_type == EP_BULK
+                || (*ep_type == EP_ISO && self.primary.dev_id.starts_with("usb")) {
                 if let Some(s) = self.iface_sessions.get(iface) {
                     if !out.iter().any(|x| Arc::ptr_eq(x, s)) {
                         out.push(s.clone());
@@ -317,7 +320,7 @@ mod tests {
         let iso = dev.iso_sessions();
         assert_eq!(iso.len(), 1);
         assert_eq!(iso[0].dev_id, "dev02");
-        let irq = dev.interrupt_sessions();
+        let irq = dev.multiplex_sessions();
         assert_eq!(irq.len(), 1);
         assert_eq!(irq[0].dev_id, "dev03");
         assert_eq!(dev.interrupt_params(0x84), (16, 4));
@@ -329,7 +332,7 @@ mod tests {
         let dev = SilexDevice::single(session("dev01"));
         assert!(!dev.is_composite());
         assert!(dev.iso_sessions().is_empty());
-        assert!(dev.interrupt_sessions().is_empty());
+        assert!(dev.multiplex_sessions().is_empty());
         assert!(Arc::ptr_eq(&dev.session_for(&cmd(3, true)), &dev.primary));
     }
 }

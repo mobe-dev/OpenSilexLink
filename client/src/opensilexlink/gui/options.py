@@ -287,11 +287,12 @@ class DevicePropertiesDialog(QDialog):
     disabled.
     """
 
-    def __init__(self, device: dict, server: dict, rule: dict | None = None, parent=None):
+    def __init__(self, device: dict, server: dict, rule: dict | None = None, parent=None, *, system_service=True):
         super().__init__(parent)
         self._device = device or {}
         self._server = server or {}
         self._rule = rule or {}
+        self._system_service = system_service
         self.setWindowTitle(
             _("Properties of {}").format(self._device.get("description", _("device"))))
         self.resize(430, 460)
@@ -346,14 +347,21 @@ class DevicePropertiesDialog(QDialog):
         r = self._rule
         w = QWidget()
         lay = QVBoxLayout(w)
-        box = QGroupBox(_("Auto connect"))
+        box = QGroupBox(_("Persistent connection"))
         v = QVBoxLayout(box)
-        self.cb_auto = QCheckBox(_("Connect this device automatically when available"))
-        self.cb_auto.setChecked(bool(r.get("auto_connect")))
-        self.cb_reconnect = QCheckBox(_("Reconnect automatically after a connection error"))
+        self.cb_auto = QCheckBox(_("Reconnect after restart, before login"))
+        bind_all = bool(self._server.get("bind_all"))
+        self.cb_auto.setChecked(bind_all or bool(r.get("auto_connect")))
+        self.cb_auto.setEnabled(self._system_service and not bind_all)
+        self.cb_auto.setToolTip(_("Controlled by Connect all USB devices on this server.") if bind_all else
+                               _("The system service connects this device at startup, without a desktop session."))
+        self.cb_reconnect = QCheckBox(_("Reconnect after an unexpected disconnect"))
         self.cb_reconnect.setChecked(bool(r.get("reconnect_on_error", True)))
         v.addWidget(self.cb_auto)
         v.addWidget(self.cb_reconnect)
+        hint = QLabel(_("Keeps retrying while the server or device is unavailable.\nManual Disconnect stays disconnected. USB devices may re-enumerate."))
+        hint.setWordWrap(True)
+        v.addWidget(hint)
         lay.addWidget(box)
 
         appbox = QGroupBox(_("Launch an application when connected"))
@@ -411,7 +419,7 @@ class DevicePropertiesDialog(QDialog):
             "mac": self._server.get("mac", ""),
             "key": self._device.get("key", ""),
             "alias": self.ed_alias.text().strip(),
-            "auto_connect": self.cb_auto.isChecked(),
+            "auto_connect": bool(self._rule.get("auto_connect")) if self._server.get("bind_all") else self.cb_auto.isChecked(),
             "reconnect_on_error": self.cb_reconnect.isChecked(),
             "launch_app": self.ed_app.text().strip(),
             "disconnect_on_app_close": self.cb_app_close.isChecked(),

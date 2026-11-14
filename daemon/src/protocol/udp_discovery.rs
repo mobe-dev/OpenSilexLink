@@ -19,7 +19,8 @@ use crate::wire::{cstr_field, rd_u16, rd_u32, read_cstr};
 
 pub const PORT: u16 = 19540;
 
-// Operation/resource codes (appear in the commit [84:86] and in responses [4:8]).
+// Legacy capture defaults: these are reply lengths, not operation codes.
+// Live transactions must acknowledge the actual received payload length.
 pub const OP_USB_DEVICE_LIST: u16 = 0x0083;
 pub const OP_SCANNER: u16 = 0x0003;
 
@@ -63,11 +64,9 @@ pub fn class_to_type(class: u8) -> &'static str {
     }
 }
 
-// Fixed layout of one list entry, measured FROM the class marker (0x??83). Reversed
-// from the live device list: status(1) 0x83(1) vid(2 BE) pid(2 BE) tag(16, NUL-pad)
-// bDeviceClass(1) bInterfaceClass(1) 4x00. The marker sits exactly 4 bytes (owner IP)
-// after the description NUL; the status high byte varies (0x80/0x84/0x87), only the
-// low byte 0x83 is constant (so do NOT search for b"\x80\x83").
+// Fixed block after ID, description and owner IPv4: capabilities/status (u16),
+// VID, PID, tag[16], device class, interface class, reserved[4]. Neither status
+// byte is constant: the DS-600 Bluetooth fixture contains 0x949b.
 const ENTRY_TAG_OFFSET: usize = 6; // marker+6: tag field
 const ENTRY_TAG_WIDTH: usize = 16;
 const ENTRY_DEVCLASS_OFFSET: usize = 22; // marker+22: bDeviceClass
@@ -121,16 +120,6 @@ fn ipv4(buf: &[u8], off: usize) -> String {
     Ipv4Addr::new(buf[off], buf[off + 1], buf[off + 2], buf[off + 3]).to_string()
 }
 
-fn find_sub(haystack: &[u8], needle: &[u8], from: usize) -> Option<usize> {
-    if needle.is_empty() || from >= haystack.len() {
-        return None;
-    }
-    haystack[from..]
-        .windows(needle.len())
-        .position(|w| w == needle)
-        .map(|p| from + p)
-}
-
 // --------------------------------------------------------------------------- //
 //  Message data structures
 // --------------------------------------------------------------------------- //
@@ -177,6 +166,7 @@ pub struct UsbDeviceEntry {
     pub id_product: u16,
     pub tag: String,      // <speed letter><index>[M<if>], e.g. "H112" or "H111M0"
     pub owner_ip: String, // holder IP ("" = free)
+    pub status_flags: u16,
     pub usb_class: u8,    // bInterfaceClass (marker+23) - the type-relevant byte
     pub dev_class: u8,    // bDeviceClass (marker+22); 0xEF = composite device
 }
@@ -190,13 +180,26 @@ impl UsbDeviceEntry {
             id_product,
             tag: tag.into(),
             owner_ip: String::new(),
+            status_flags: 0,
             usb_class: 0,
             dev_class: 0,
         }
     }
 
+    /// Per-port USB connection password, independent of the web login password.
+    pub fn password_required(&self) -> bool {
+        self.status_flags & 0x0010 != 0
+    }
+
     /// sel high byte for the tunnel (dev01->0x03, dev02->0x04, devNN->NN+2).
     pub fn dev_index(&self) -> u8 {
+        if let Some(location) = self.dev_id.strip_prefix("usb") {
+            if let Some((_, address)) = location.split_once('-') {
+                if let Ok(address) = address.split(':').next().unwrap_or("").parse::<u8>() {
+                    return address;
+                }
+            }
+        }
         let digits: String = self.dev_id.chars().rev().take_while(|c| c.is_ascii_digit())
             .collect::<String>().chars().rev().collect();
         match digits.parse::<u32>() {
@@ -211,6 +214,7 @@ impl UsbDeviceEntry {
             Some('L') => "1.5 Mbps (Low-Speed)",
             Some('F') => "12 Mbps (Full-Speed)",
             Some('H') => "480 Mbps (High-Speed)",
+            Some('S') => "5 Gbps (SuperSpeed)",
             _ => "",
         }
     }
@@ -258,60 +262,37 @@ pub struct DeviceListResponse {
 }
 
 impl DeviceListResponse {
-    fn parse(buf: &[u8]) -> DeviceListResponse {
-        // Per entry: id(NUL), description(NUL), 4-byte owner IP, then the fixed
-        // 28-byte block from the class marker (see ENTRY_*). The 4 bytes directly
-        // BEFORE the marker are the holder IP (0.0.0.0 = free). IMPORTANT: the marker
-        // high byte varies (0x80/0x84/...), only the low byte 0x83 is constant.
-        let op_code = if buf.len() >= 8 { rd_u32(buf, 4) } else { 0 };
-        let count = if buf.len() > 8 { buf[8] } else { 0 };
+    fn parse(buf: &[u8]) -> Result<DeviceListResponse> {
+        crate::wire::need(buf, 9, "device list")?;
+        let op_code = rd_u32(buf, 4);
+        let count = buf[8];
         let mut devices = Vec::new();
         let mut pos = 9usize;
         for _ in 0..count {
-            // advance to the next entry: first ASCII letter (start of "devNN")
-            while pos < buf.len() && !(0x41..=0x7A).contains(&buf[pos]) {
-                pos += 1;
-            }
-            if pos >= buf.len() {
-                break;
-            }
             let (dev_id, p) = read_cstr(buf, pos);
+            if !(dev_id.starts_with("dev") || dev_id.starts_with("usb")) || p > buf.len() {
+                bail!("invalid or truncated device ID");
+            }
             let (description, p) = read_cstr(buf, p);
-            pos = p;
-            let mut mk = pos + 4; // 4-byte owner IP, then the marker
-            // Validate the marker; on mismatch resync forward on the 0x83 low byte
-            // (defensive, in case padding ever slips in between).
-            if !(mk + 1 < buf.len() && buf[mk + 1] == 0x83) {
-                match find_sub(buf, &[0x83], pos) {
-                    Some(nxt) if nxt >= 1 => mk = nxt - 1,
-                    _ => break,
-                }
-            }
-            if mk + ENTRY_STRIDE_FROM_MARKER > buf.len() {
-                break;
-            }
-            let owner_ip = {
-                let o = ipv4(buf, mk - 4);
-                if o == "0.0.0.0" { String::new() } else { o }
-            };
-            let id_vendor = rd_u16(buf, mk + 2);
-            let id_product = rd_u16(buf, mk + 4);
-            let tag = cstr_field(buf, mk + ENTRY_TAG_OFFSET, Some(ENTRY_TAG_WIDTH));
-            let dev_class = buf[mk + ENTRY_DEVCLASS_OFFSET];
-            let usb_class = buf[mk + ENTRY_IFCLASS_OFFSET];
+            let mk = p + 4;
+            crate::wire::need(buf, mk + ENTRY_STRIDE_FROM_MARKER, "device list entry")?;
+            // The two bytes after owner IPv4 vary by model and device state;
+            // they are metadata, not a fixed 0x??83 delimiter.
+            let owner = ipv4(buf, p);
             devices.push(UsbDeviceEntry {
                 dev_id,
                 description,
-                id_vendor,
-                id_product,
-                tag,
-                owner_ip,
-                usb_class,
-                dev_class,
+                id_vendor: rd_u16(buf, mk + 2),
+                id_product: rd_u16(buf, mk + 4),
+                tag: cstr_field(buf, mk + ENTRY_TAG_OFFSET, Some(ENTRY_TAG_WIDTH)),
+                owner_ip: if owner == "0.0.0.0" { String::new() } else { owner },
+                status_flags: rd_u16(buf, mk),
+                usb_class: buf[mk + ENTRY_IFCLASS_OFFSET],
+                dev_class: buf[mk + ENTRY_DEVCLASS_OFFSET],
             });
             pos = mk + ENTRY_STRIDE_FROM_MARKER;
         }
-        DeviceListResponse { op_code, count, devices }
+        Ok(DeviceListResponse { op_code, count, devices })
     }
 }
 
@@ -510,8 +491,12 @@ pub fn parse(buf: &[u8]) -> Result<Message> {
         }
         if subcode == 0x0000 {
             let op_code = if buf.len() >= 8 { rd_u32(buf, 4) } else { 0 };
-            if buf.len() >= 15 && &buf[9..12] == b"dev" {
-                return Ok(Message::DeviceList(DeviceListResponse::parse(buf)));
+            // DS-600 transport version 2.3.0 replies with exactly nine bytes
+            // when the last device is unplugged: header, length, zero count.
+            // Treat it as an authoritative list so stale devices are removed.
+            let empty_list = opcode == 0x0001 && buf.len() == 9 && buf[8] == 0;
+            if empty_list || (buf.len() >= 15 && (buf[9..].starts_with(b"dev") || buf[9..].starts_with(b"usb"))) {
+                return DeviceListResponse::parse(buf).map(Message::DeviceList);
             }
             return Ok(Message::Simple(SimpleResponse {
                 opcode,
@@ -569,6 +554,17 @@ fn parse_command(opcode: u16, buf: &[u8]) -> Result<CommandRequest> {
 // --------------------------------------------------------------------------- //
 //  Builders (host -> device)
 // --------------------------------------------------------------------------- //
+/// Finish a single-datagram query, including negative replies such as DENY.
+/// Offset 84 acknowledges the number of payload bytes actually received.
+pub fn build_commit(query: &[u8], payload_len: usize) -> Result<Vec<u8>> {
+    crate::wire::need(query, SIZE_GET, "query to commit")?;
+    let len = u16::try_from(payload_len)?;
+    let mut commit = query[..SIZE_GET].to_vec();
+    commit[..2].copy_from_slice(&(Phase::Commit as u16).to_be_bytes());
+    commit[84..86].copy_from_slice(&len.to_be_bytes());
+    Ok(commit)
+}
+
 fn build_command(opcode: u16, command: &[u8], size: usize, op_code: u16, params: &[u8]) -> Vec<u8> {
     let mut buf = vec![0u8; size];
     buf[0..2].copy_from_slice(&opcode.to_be_bytes());
@@ -618,6 +614,31 @@ pub fn build_connect(
     Ok(build_command(phase as u16, CMD_CONNECT, size, op_code, &params))
 }
 
+/// DS-600 per-port password extension. The firmware uses this reversible
+/// IPv4-seeded encoding; it is wire compatibility, not secure encryption.
+pub fn build_password_connect(mac: &[u8], host_ip: &str, dev_id: &str, password: &[u8]) -> Result<Vec<u8>> {
+    if password.len() > 16 || password.contains(&0) {
+        bail!("USB port password must contain at most 16 bytes and no NUL");
+    }
+    let ip: Ipv4Addr = host_ip.parse()?;
+    let octets = ip.octets();
+    let mut token = CONNECT_TOKEN;
+    token[2] |= 4;
+    let mut query = build_connect(mac, host_ip, dev_id, Phase::Query, &token, None)?;
+    query[88] = password.len() as u8;
+    let mut a = u16::from(octets[0]);
+    let mut b = u16::from(octets[1]);
+    for (out, byte) in query[89..].iter_mut().zip(password) {
+        a = a.wrapping_mul(17).wrapping_add(2941);
+        b = b.wrapping_mul(49).wrapping_add(8379);
+        *out = byte ^ (a ^ b) as u8;
+        let next_a = b.wrapping_mul(37).wrapping_add(4551);
+        b = next_a ^ a.wrapping_mul(23).wrapping_add(16767);
+        a = next_a;
+    }
+    Ok(query)
+}
+
 pub fn build_disconnect(
     mac: &[u8],
     host_ip: &str,
@@ -644,6 +665,59 @@ pub fn build_poll() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ds600_bluetooth_device_list() {
+        let bytes = hx("000100000000010d04757362312d3030323a3000437970726573732053656d6920435957323037303441320000000000949b04b4f9014631314d300000000000000000000000e0e000000000757362312d3030323a3100437970726573732053656d6920435957323037303441320000000000949b04b4f9014631314d310000000000000000000000e0e000000000757362312d3030323a3200437970726573732053656d6920435957323037303441320000000000949b04b4f9014631314d320000000000000000000000e0ff00000000757362312d3030323a3300437970726573732053656d6920435957323037303441320000000000949b04b4f9014631314d330000000000000000000000e0fe00000000");
+        let list = match parse(&bytes).unwrap() {
+            Message::DeviceList(list) => list,
+            other => panic!("expected device list, got {other:?}"),
+        };
+        assert_eq!(list.devices.len(), 4);
+        assert_eq!(list.devices[0].dev_id, "usb1-002:0");
+        assert_eq!(list.devices[0].id_vendor, 0x04b4);
+        assert_eq!(list.devices[0].id_product, 0xf901);
+        assert_eq!(list.devices[0].status_flags, 0x949b);
+        assert!(list.devices.iter().all(UsbDeviceEntry::password_required));
+        assert_eq!(logical_devices(&list.devices).len(), 1);
+    }
+
+    #[test]
+    fn ds600_empty_list_is_authoritative() {
+        // Captured from DS-600 transport 2.3.0 with both USB ports empty.
+        let msg = parse(&hx("000100000000000100")).unwrap();
+        match msg {
+            Message::DeviceList(list) => {
+                assert_eq!(list.op_code, 1);
+                assert_eq!(list.count, 0);
+                assert!(list.devices.is_empty());
+            }
+            other => panic!("expected empty device list, got {other:?}"),
+        }
+        // Commit acknowledgements must not clear a device list.
+        assert!(matches!(parse(&hx("000300000000000000")).unwrap(), Message::Simple(_)));
+    }
+
+    #[test]
+    fn password_encoding_matches_ds600_firmware_vectors() {
+        // Expected bytes obtained by executing the firmware's ARM decoder in
+        // an emulator against known plaintext. XOR encoding is symmetric.
+        for (ip, password, expected) in [
+            ("192.0.2.40", "interoperability", "efea7293722d96611477628b6a2d320f"),
+            ("192.168.178.40", "password", "ae756d2dc755bc80"),
+            ("255.255.0.1", "0123456789abcdef", "d6d27b775bc208b429651ecdb5c73c32"),
+        ] {
+            let query = build_password_connect(&[0; 6], ip, "usb1-002:0", password.as_bytes()).unwrap();
+            assert_eq!(query[88] as usize, password.len());
+            assert_eq!(&query[89..89 + password.len()], hx(expected));
+            match parse(&query).unwrap() {
+                Message::Command(request) => assert_eq!(request.token[2] & 4, 4),
+                other => panic!("unexpected query: {other:?}"),
+            }
+        }
+        assert!(build_password_connect(&[0; 6], "192.0.2.40", "usb1-002:0", &[b'x'; 17]).is_err());
+        assert!(build_password_connect(&[0; 6], "192.0.2.40", "usb1-002:0", b"a\0b").is_err());
+    }
 
     // Real device-list bytes; the owner IP is replaced by a documentation address
     // (c0000286 = 192.0.2.134).

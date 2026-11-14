@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+import sys
 
 from . import __version__, ipc
 
@@ -48,7 +49,7 @@ def cmd_ipc(args) -> int:
         return 0
 
     with ipc.IpcClient(addr) as cli:
-        result = cli.call(args.method, params)
+        result = cli.call(args.method, params, timeout=120.0 if args.method in ("connect", "disconnect") else 10.0)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     return 0
 
@@ -76,7 +77,11 @@ def main(argv=None) -> int:
     p.set_defaults(func=cmd_gui)
 
     args = ap.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except (ipc.IpcError, OSError, ValueError, TimeoutError) as exc:
+        print(f"osl: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

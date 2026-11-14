@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/python3 -I
 # Launcher for the OpenSilexLink GUI, installed by the .deb/.rpm package.
 # The Python client ships under /usr/lib/opensilexlink (distro-independent, no
 # reliance on the site-packages layout); put it on sys.path and call main().

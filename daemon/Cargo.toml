@@ -1,11 +1,11 @@
 [package]
 name = "silex-daemon"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 rust-version = "1.75"
-description = "OpenSilexLink daemon: Silex DS-510 (USB-over-Ethernet) to USB/IP bridge"
+description = "OpenSilexLink daemon: Silex DS-510 / DS-600 (USB-over-Ethernet) to USB/IP bridge"
 license = "MIT"
-repository = "https://github.com/bytewarrior/OpenSilexLink"
+repository = "https://github.com/mobe-dev/OpenSilexLink"
 default-run = "silex-daemon"
 
 [[bin]]
@@ -26,4 +26,4 @@ dns-lookup = "2"
 hex = "0.4"
 
 [dev-dependencies]
-# (unit tests use only std + the crates above)
+tokio = { version = "1", features = ["test-util"] }

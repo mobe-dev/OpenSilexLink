@@ -15,14 +15,15 @@ import subprocess
 import sys
 import threading
 import time
+import ipaddress
 
-from PySide6.QtCore import Qt, QObject, Signal
+from PySide6.QtCore import Qt, QObject, Signal, QTimer, QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QTreeWidget, QTreeWidgetItem, QToolBar,
     QPushButton, QWidget, QVBoxLayout, QHBoxLayout, QMessageBox, QStyle, QMenu,
-    QSystemTrayIcon, QCheckBox,
+    QSystemTrayIcon, QCheckBox, QLabel, QInputDialog, QHeaderView,
 )
-from PySide6.QtGui import QAction, QIcon
+from PySide6.QtGui import QAction, QIcon, QDesktopServices
 
 from .. import __version__, ipc
 from .. import i18n
@@ -41,7 +42,7 @@ from .options import OptionsDialog, DevicePropertiesDialog
 _ROLE = Qt.UserRole
 
 # Brand name (kept untranslated).
-APP_TITLE = "Silex USB Device Server"
+APP_TITLE = "OpenSilexLink"
 PROJECT_URL = "https://github.com/bytewarrior/OpenSilexLink"
 
 # The daemon executable (the Rust silex-daemon binary).
@@ -62,9 +63,11 @@ class _Bridge(QObject):
 class MainWindow(QMainWindow):
     def __init__(self, address=None):
         super().__init__()
-        self.setWindowTitle(APP_TITLE)
-        self.resize(560, 480)
-        self._address = address or ipc.default_socket_path()
+        self._privileged = os.geteuid() == 0
+        self.setWindowTitle(APP_TITLE + (_(" — Administrator mode") if self._privileged else ""))
+        self.resize(940, 640)
+        self.setMinimumSize(700, 480)
+        self._address = ipc.SYSTEM_SOCKET if self._privileged else (address or ipc.default_socket_path())
         self._bridge = _Bridge()
         self._bridge.servers.connect(self._render)
         self._bridge.op_done.connect(self._on_op_done)
@@ -76,13 +79,19 @@ class MainWindow(QMainWindow):
         self._servers: list[dict] = []
         self._notify_errors = True        # setting "notify on error"
         self._confirm_disconnect = True   # confirm before disconnecting
-        self._hide_on_close = True        # close -> tray instead of quitting
+        self._hide_on_close = not self._privileged  # administrator windows exit on close
         self._filter_enabled = False      # display filter (only checked servers)
         self._filter_servers: list[str] = []
         self._columns = list(resolve_columns(None))   # visible columns (options tab 3)
         self._column_widths: dict = {}
         self._flat_view = False           # False = device view (tree), True = server view (table)
         self.client: DaemonClient | None = None
+        self._daemon_error = ""
+        self._health_pending = False
+        self._online = False
+        self._operation_pending = False
+        self._policy_pending = False
+        self._system_service = self._address == ipc.SYSTEM_SOCKET
         self._tray: QSystemTrayIcon | None = None
         self._tray_hint_shown = False    # show the "keeps running" balloon only once
         self._quitting = False           # real quit vs. minimize to tray
@@ -95,12 +104,16 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._build_tray()
         self._start()
+        self._health_timer = QTimer(self)
+        self._health_timer.timeout.connect(self._check_service)
+        self._health_timer.start(5000)
 
     # -- UI construction --------------------------------------------------- #
     def _build_ui(self) -> None:
         style = self.style()
         tb = QToolBar()
         tb.setMovable(False)
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(tb)
         act_refresh = QAction(style.standardIcon(QStyle.SP_BrowserReload), _("Refresh"), self)
         act_refresh.triggered.connect(self._refresh)
@@ -116,11 +129,19 @@ class MainWindow(QMainWindow):
         act_help = QAction(style.standardIcon(QStyle.SP_MessageBoxQuestion), _("Help"), self)
         act_help.triggered.connect(self._help)
         tb.addAction(act_refresh)
+        act_add = QAction(_("Add server…"), self)
+        act_add.triggered.connect(self._add_server)
+        tb.addAction(act_add)
+        tb.addSeparator()
         tb.addAction(self.act_toggle)
         tb.addAction(act_settings)
         tb.addAction(act_help)
 
         self.tree = QTreeWidget()
+        self.tree.setAlternatingRowColors(True)
+        self.tree.setUniformRowHeights(True)
+        self.tree.setIndentation(22)
+        self.tree.setStyleSheet("QTreeWidget { border: 1px solid #64748b; border-radius: 6px; } QTreeView::item { padding: 12px 6px; }")
         self.tree.itemSelectionChanged.connect(self._update_buttons)
         self.tree.itemDoubleClicked.connect(lambda *_a: self._toggle_selected())
         self.tree.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -132,19 +153,142 @@ class MainWindow(QMainWindow):
         self.btn_disconnect.clicked.connect(self._do_disconnect)
         self.btn_connect.setEnabled(False)
         self.btn_disconnect.setEnabled(False)
+        self.btn_web = QPushButton(_("Open server settings"))
+        self.btn_web.clicked.connect(self._open_server_web)
+        self.btn_web.setEnabled(False)
 
         buttons = QHBoxLayout()
+        buttons.addWidget(self.btn_web)
         buttons.addStretch(1)
         buttons.addWidget(self.btn_connect)
         buttons.addWidget(self.btn_disconnect)
-        buttons.addStretch(1)
 
         central = QWidget()
         lay = QVBoxLayout(central)
+        lay.setContentsMargins(24, 22, 24, 22)
+        lay.setSpacing(16)
+        heading = QHBoxLayout()
+        title = QLabel(_("USB devices, over your network"))
+        title.setStyleSheet("font-size: 23px; font-weight: 600;")
+        heading.addWidget(title)
+        heading.addStretch()
+        if self._privileged:
+            badge = QLabel(_("Administrator mode"))
+            badge.setToolTip(_("Automatic application launches are disabled. Closing this window exits administrator mode."))
+            heading.addWidget(badge)
+        self.service_status = QLabel(_("Connecting…"))
+        heading.addWidget(self.service_status)
+        lay.addLayout(heading)
+        self.summary = QLabel(_("Discovering USB device servers…"))
+        lay.addWidget(self.summary)
         lay.addWidget(self.tree, 1)
+        self.details = QLabel(_("Select a USB device to connect it to this computer."))
+        self.details.setWordWrap(True)
+        self.details.setTextFormat(Qt.PlainText)
+        self.details.setMinimumHeight(42)
+        lay.addWidget(self.details)
+        self.cb_bind_all = QCheckBox(_("Connect all USB devices on this server"))
+        self.cb_bind_all.setToolTip(_("Connects all available devices now, before login after restart, and when new devices appear. Manual Disconnect stays disconnected. Turning this off leaves current connections in place."))
+        self.cb_bind_all.toggled.connect(self._save_server_binding)
+        lay.addWidget(self.cb_bind_all)
+        policies = QHBoxLayout()
+        self.cb_restart = QCheckBox(_("Reconnect after restart, before login"))
+        self.cb_restart.setToolTip(_("Saved by the system service. Connects at system startup without logging in."))
+        self.cb_loss = QCheckBox(_("Reconnect after an unexpected disconnect"))
+        self.cb_loss.setToolTip(_("Keeps retrying until the device returns. Manual Disconnect cancels recovery. USB devices may re-enumerate."))
+        self.cb_restart.toggled.connect(lambda checked: self._save_connection_policy("auto_connect", checked))
+        self.cb_loss.toggled.connect(lambda checked: self._save_connection_policy("reconnect_on_error", checked))
+        policies.addWidget(self.cb_restart)
+        policies.addWidget(self.cb_loss)
+        policies.addStretch()
+        lay.addLayout(policies)
         lay.addLayout(buttons)
         self.setCentralWidget(central)
         self.statusBar().showMessage(_("Connecting to daemon ..."))
+
+    def _add_server(self) -> None:
+        address, ok = QInputDialog.getText(self, _("Add device server"), _("IPv4 address:"))
+        if not ok:
+            return
+        try:
+            address = str(ipaddress.IPv4Address(address.strip()))
+        except ValueError:
+            QMessageBox.warning(self, APP_TITLE, _("Enter a valid IPv4 address."))
+            return
+        client = self.client
+        if client is None or not self._online:
+            self.statusBar().showMessage(_("Connect to the background service first."))
+            return
+        def work():
+            try:
+                settings = client.get_settings()
+                addresses = settings.get("search_addresses", [])
+                if not any(a.get("address") == address for a in addresses):
+                    addresses.append({"address": address, "port": 19540})
+                client.set_settings({"search_enabled": True, "search_addresses": addresses})
+                client.refresh()
+                self._bridge.op_done.emit("server", True, _("Server added. Waiting for discovery…"))
+            except (ipc.IpcError, OSError, TimeoutError) as exc:
+                self._bridge.op_done.emit("server", False, str(exc))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _open_server_web(self) -> None:
+        server = self._selected_server()
+        if server and server.get("ip"):
+            try:
+                address = str(ipaddress.IPv4Address(server["ip"]))
+            except ValueError:
+                return
+            QDesktopServices.openUrl(QUrl(f"http://{address}/"))
+
+    def _check_service(self) -> None:
+        if self._health_pending or not self._online or self.client is None:
+            return
+        self._health_pending = True
+        client = self.client
+        def work():
+            try:
+                client.hello()
+            except (ipc.IpcError, OSError, TimeoutError):
+                self._bridge.daemon_lost.emit()
+            finally:
+                self._health_pending = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _save_connection_policy(self, field: str, enabled: bool) -> None:
+        device, server = self._selected_device(), self._selected_server()
+        client = self.client
+        if not device or not server or client is None or not self._online or self._policy_pending:
+            return
+        self._policy_pending = True
+        self.cb_restart.setEnabled(False)
+        self.cb_loss.setEnabled(False)
+        self.cb_bind_all.setEnabled(False)
+        patch = {"mac": server["mac"], "key": device["key"], field: enabled}
+        def work():
+            try:
+                client.set_device_rule(patch)
+                self._bridge.op_done.emit("policy", True, _("Connection preferences saved in the background service."))
+            except (ipc.IpcError, OSError) as exc:
+                self._bridge.op_done.emit("policy", False, str(exc))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _save_server_binding(self, enabled: bool) -> None:
+        server, client = self._selected_server(), self.client
+        if not server or client is None or not self._online or self._policy_pending:
+            return
+        self._policy_pending = True
+        self._update_buttons()
+        mac = server["mac"]
+        def work():
+            try:
+                client.set_bind_all(mac, enabled)
+                message = (_("Connecting all available USB devices. New devices will connect automatically.") if enabled else
+                           _("Connect-all disabled. Current connections remain connected."))
+                self._bridge.op_done.emit("policy", True, message)
+            except (ipc.IpcError, OSError, TimeoutError) as exc:
+                self._bridge.op_done.emit("policy", False, str(exc))
+        threading.Thread(target=work, daemon=True).start()
 
     # -- Tray icon --------------------------------------------------------- #
     def _build_tray(self) -> None:
@@ -293,9 +437,10 @@ class MainWindow(QMainWindow):
     def _connect_daemon(self) -> None:
         if not self._ensure_daemon():
             self._bridge.op_done.emit("daemon", False,
-                                      _("Daemon not reachable and failed to start."))
+                                      self._daemon_error or _("Daemon not reachable and failed to start."))
             return
         try:
+            self._system_service = bool(self.client.hello().get("system_service"))
             self.client.subscribe()          # initial state arrives as a servers event
             try:
                 self._apply_settings_cache(self.client.get_settings())
@@ -309,7 +454,7 @@ class MainWindow(QMainWindow):
         """Cache the GUI-relevant switches (for prompt/close behaviour)."""
         self._notify_errors = bool(settings.get("notify_errors", self._notify_errors))
         self._confirm_disconnect = bool(settings.get("confirm_disconnect", self._confirm_disconnect))
-        self._hide_on_close = bool(settings.get("hide_on_close", self._hide_on_close))
+        self._hide_on_close = not self._privileged and bool(settings.get("hide_on_close", self._hide_on_close))
         self._filter_enabled = bool(settings.get("filter_enabled", self._filter_enabled))
         self._filter_servers = list(settings.get("filter_servers", self._filter_servers))
         self._columns = resolve_columns(settings.get("columns", self._columns))
@@ -340,8 +485,11 @@ class MainWindow(QMainWindow):
         try:
             self.client.connect()
             return True
-        except OSError:
-            pass
+        except OSError as exc:
+            self._daemon_error = str(exc)
+        if self._address == ipc.SYSTEM_SOCKET:
+            self._daemon_error = _("Service unavailable: {}. Check opensilexlink.service and membership of the opensilexlink group.").format(self._daemon_error)
+            return False
         # Start the daemon itself (desktop: attach/detach via pkexec).
         try:
             subprocess.Popen(self._daemon_command(),
@@ -389,6 +537,10 @@ class MainWindow(QMainWindow):
         else:
             self._render_tree(self._visible_servers(), sel)
         self._update_buttons()
+        devices = [dev for server in servers for dev in server.get("devices", [])]
+        count = sum(dev.get("status") == "connected" for dev in devices)
+        self.summary.setText(_("{} servers · {} USB devices · {} connected").format(len(servers), len(devices), count)
+                             if servers else _("No servers found. Add a server by its IP address, or check its network connection."))
         if self._tray is not None:
             self._tray.setToolTip(f"{APP_TITLE} - {tray_summary(servers)}")
             self._rebuild_tray_menu()
@@ -396,6 +548,8 @@ class MainWindow(QMainWindow):
 
     # -- App launch on connect / disconnect on app close (client only) ----- #
     def _handle_app_launch(self, servers: list) -> None:
+        if self._privileged:
+            return
         current = connected_keys(servers)
         if not self._launch_baseline:
             # First state = baseline: do NOT launch apps for already-connected devices.
@@ -413,6 +567,8 @@ class MainWindow(QMainWindow):
         self._connected_prev = current
 
     def _launch_app(self, spec: dict) -> None:
+        if self._privileged:
+            return
         key = (spec["mac"], spec["dev_id"])
         try:
             proc = subprocess.Popen(shlex.split(spec["app"]))
@@ -445,13 +601,19 @@ class MainWindow(QMainWindow):
     def _render_tree(self, servers: list, sel) -> None:
         """USB device view: a tree grouped by device server (name + status)."""
         self.tree.setColumnCount(2)
-        self.tree.setHeaderHidden(True)              # like SX VL (device view without header)
-        self.tree.setColumnWidth(0, 320)
+        self.tree.setHeaderHidden(False)
+        self.tree.setHeaderLabels([_("Device / server"), _("Connection")])
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         for srv in servers:
-            node = QTreeWidgetItem([server_label(srv), ""])
+            node = QTreeWidgetItem([f"{srv.get('model') or 'Silex'}  ·  {srv.get('ip', '')}  ·  {srv.get('hostname', '')}", ""])
+            node.setData(0, _ROLE, (srv.get("mac", ""), None))
             node.setIcon(0, self._server_icon())
             node.setFirstColumnSpanned(True)
             self.tree.addTopLevelItem(node)
+            if sel == (srv.get("mac", ""), None):
+                node.setSelected(True)
+                self.tree.setCurrentItem(node)
             node.setExpanded(True)
             for dev in srv.get("devices", []):
                 item = QTreeWidgetItem([display_name(dev) or "?", status_text(dev)])
@@ -497,6 +659,8 @@ class MainWindow(QMainWindow):
         mac, dev_id = ref
         for srv in self._servers:
             if srv.get("mac", "") == mac:
+                if dev_id is None:
+                    return srv, None
                 for dev in srv.get("devices", []):
                     if dev.get("dev_id") == dev_id:
                         return srv, dev
@@ -504,8 +668,31 @@ class MainWindow(QMainWindow):
 
     def _update_buttons(self) -> None:
         dev = self._selected_device()
-        self.btn_connect.setEnabled(bool(dev) and can_connect(dev))
-        self.btn_disconnect.setEnabled(bool(dev) and can_disconnect(dev))
+        self.btn_connect.setEnabled(self._online and not self._operation_pending and bool(dev) and can_connect(dev))
+        self.btn_disconnect.setEnabled(self._online and not self._operation_pending and bool(dev) and can_disconnect(dev))
+        server = self._selected_server()
+        self.btn_web.setEnabled(bool(server))
+        bind_all = bool(server and server.get("bind_all"))
+        self.cb_bind_all.blockSignals(True)
+        self.cb_bind_all.setChecked(bind_all)
+        self.cb_bind_all.blockSignals(False)
+        self.cb_bind_all.setEnabled(self._online and bool(server) and not self._policy_pending and not self._operation_pending)
+        for checkbox, field, fallback in ((self.cb_restart, "auto_connect", False),
+                                           (self.cb_loss, "reconnect_on_error", True)):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(bool(dev.get(field, fallback)) if dev else False)
+            checkbox.blockSignals(False)
+            checkbox.setEnabled(self._online and bool(dev) and not self._policy_pending and
+                                (field != "auto_connect" or (self._system_service and not bind_all)))
+        if dev:
+            self.details.setText(f"{display_name(dev)}  ·  {dev.get('id_vendor', 0):04x}:{dev.get('id_product', 0):04x}  ·  {dev.get('speed', '')}  ·  {server.get('ip', '') if server else ''}\n" +
+                                 (_("USB connection password required. Configure the USB port in server settings.") if dev.get("password_required") else
+                                  _("Unmount storage in your file manager before disconnecting.") if dev.get("usb_class") == 8 else
+                                  _("Uses this computer’s normal USB driver after connection.")))
+        elif server:
+            self.details.setText(_("Connect all devices on this server, including devices behind a USB docking station. Devices in use by another computer or requiring a USB password are left available for individual connection."))
+        else:
+            self.details.setText(_("Select a USB device to see its status and connection controls."))
 
     # -- Actions ----------------------------------------------------------- #
     def _toggle_selected(self) -> None:
@@ -555,10 +742,13 @@ class MainWindow(QMainWindow):
             daemon=True).start()
 
     def _run_op(self, kind: str) -> None:
+        if self._operation_pending or not self._online:
+            return
         ref = self._selected_ref()
         if not ref or self.client is None:
             return
         mac, dev_id = ref
+        self._operation_pending = True
         self.btn_connect.setEnabled(False)
         self.btn_disconnect.setEnabled(False)
         self.statusBar().showMessage(
@@ -578,11 +768,28 @@ class MainWindow(QMainWindow):
 
     def _on_op_done(self, kind: str, ok: bool, message: str) -> None:
         if kind == "daemon":
+            self._online = ok
+            self.service_status.setText(_("● Service online") if ok else _("● Service offline"))
+            self.service_status.setStyleSheet("color: #15803d; font-weight: 600;" if ok else "color: #b45309; font-weight: 600;")
             self.statusBar().showMessage(message)
             if not ok:
-                QMessageBox.warning(self, "Daemon", message)
+                QTimer.singleShot(5000, self._start)
+            self._update_buttons()
+            return
+        if kind == "server":
+            self.statusBar().showMessage(message)
+            if not ok:
+                QMessageBox.warning(self, APP_TITLE, message)
+            return
+        if kind == "policy":
+            self._policy_pending = False
+            self.statusBar().showMessage(message)
+            if not ok:
+                QMessageBox.warning(self, APP_TITLE, message)
+            self._update_buttons()
             return
         action = _("Connect") if kind == "connect" else _("Disconnect")
+        self._operation_pending = False
         if ok:
             self.statusBar().showMessage(_("Connected.") if kind == "connect" else _("Disconnected."))
             if not self.isVisible():          # window in tray -> show balloon
@@ -598,7 +805,18 @@ class MainWindow(QMainWindow):
         self._update_buttons()
 
     def _on_daemon_lost(self) -> None:
+        if not self._online:
+            return
+        self._online = False
+        self._operation_pending = False
+        self.service_status.setText(_("● Service offline"))
+        self.service_status.setStyleSheet("color: #b45309; font-weight: 600;")
+        self._update_buttons()
+        if self.client:
+            self.client.close()
+        self.client = None
         self.statusBar().showMessage(_("Lost connection to the daemon."))
+        QTimer.singleShot(2000, self._start)
 
     # -- Request use (send/receive side) ----------------------------------- #
     def _do_request(self) -> None:
@@ -703,6 +921,7 @@ class MainWindow(QMainWindow):
         a_auto = menu.addAction(_("Auto connect"))
         a_auto.setCheckable(True)
         a_auto.setChecked(bool(rule.get("auto_connect")))
+        a_auto.setEnabled(not (self._selected_server() or {}).get("bind_all", False))
         a_auto.toggled.connect(lambda on: self._set_autoconnect(ref, dev, on))
         menu.addSeparator()
         menu.addAction(_("Properties...")).triggered.connect(self._open_properties)
@@ -740,7 +959,7 @@ class MainWindow(QMainWindow):
         if dev is None or srv is None:
             return
         rule = self._rule_for(self._selected_ref())
-        dlg = DevicePropertiesDialog(dev, srv, rule, self)
+        dlg = DevicePropertiesDialog(dev, srv, rule, self, system_service=self._system_service)
         if dlg.exec():
             patch = dlg.result_rule()
             threading.Thread(
@@ -825,12 +1044,19 @@ def main() -> int:
     # Language from the system locale (supports DE/EN; otherwise English).
     lang = i18n.set_language(QLocale.system().name())
     _install_translations(app, lang)
+    from .privilege import needs_privilege, offer_privileged_launch
+    privileged = os.geteuid() == 0
+    address = ipc.SYSTEM_SOCKET if privileged else (os.environ.get("SILEX_IPC") or ipc.default_socket_path())
+    if needs_privilege(address):
+        return offer_privileged_launch()
     # Closing the window minimizes to the tray -> do not quit the app when a tray exists.
     tray = QSystemTrayIcon.isSystemTrayAvailable()
-    app.setQuitOnLastWindowClosed(not tray)
-    win = MainWindow(address=os.environ.get("SILEX_IPC"))
+    app.setQuitOnLastWindowClosed(privileged or not tray)
+    win = MainWindow(address=address)
+    if privileged:
+        win._hide_on_close = False
     # start_hidden only when a tray exists - otherwise the app would be unreachable.
-    if _want_hidden(sys.argv) and tray:
+    if not privileged and _want_hidden(sys.argv) and tray:
         win.hide()
     else:
         win.show()

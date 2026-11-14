@@ -104,6 +104,30 @@ pub struct SilexFrame {
 }
 
 impl SilexFrame {
+    /// DS-600 iso keeps the 24-byte header, but uses bInterval at +12 and
+    /// a reserved word at +14 in place of the legacy frame counter. Firmware
+    /// sxuptp_urb_create_isoc converts +12 to 1 << (bInterval - 1).
+    pub fn to_ds600_request_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.to_bytes();
+        if self.is_request {
+            if self.transfer_type() == TransferType::Isochronous {
+                bytes[12..14].copy_from_slice(&self.interval.clamp(1, 16).to_be_bytes());
+                bytes[14..16].fill(0);
+            } else {
+                bytes.splice(4..4, [0, 1]);
+            }
+        }
+        bytes
+    }
+
+    /// DS-600 responses have a 10-byte header, without the DS-510 status2 word.
+    pub fn parse_ds600_response(bytes: &[u8]) -> Result<Self> {
+        need(bytes, 10, "DS-600 response")?;
+        let mut normalized = bytes.to_vec();
+        normalized.splice(10..10, [0, 0]);
+        Ok(Self::parse(&normalized, 0)?.0)
+    }
+
     pub fn transfer_type(&self) -> TransferType {
         TransferType::from_opcode(self.opcode).expect("valid opcode")
     }
@@ -329,6 +353,26 @@ pub fn iter_frames(data: &[u8]) -> Result<Vec<SilexFrame>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ds600_captured_descriptor_response_and_request() {
+        let response = hex::decode("0001000100000000001212010002e0010140b40401f9120101020301").unwrap();
+        let frame = SilexFrame::parse_ds600_response(&response).unwrap();
+        assert_eq!(frame.seq, 1);
+        assert_eq!(frame.status1, 0);
+        assert_eq!(frame.data, hex::decode("12010002e0010140b40401f9120101020301").unwrap());
+        let request = SilexFrame {
+            opcode: 1, seq: 1, is_request: true,
+            sel: Some(0x0200), tag: REQUEST_TAG,
+            bm_request_type: Some(0x80), b_request: Some(6),
+            w_value: Some(0x0100), w_index: Some(0), w_length: Some(18),
+            ..Default::default()
+        };
+        assert_eq!(request.to_ds600_request_bytes(), hex::decode("00010001000102000205000880060100000000000012").unwrap());
+        // A zero-length OUT completion is exactly ten bytes on this server.
+        let ack = hex::decode("80010002000000000000").unwrap();
+        assert!(SilexFrame::parse_ds600_response(&ack).unwrap().data.is_empty());
+    }
 
     fn roundtrip(frame: &SilexFrame) {
         let bytes = frame.to_bytes();
@@ -559,6 +603,25 @@ mod tests {
         assert_eq!(rd_u32(&b, 20), 12 + 4); // body length
         assert_eq!(b.len(), 24 + 12 + 4);
         assert_eq!(&b[24 + 12..], &[0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn ds600_iso_uses_endpoint_interval_not_legacy_frame_counter() {
+        for opcode in [0x0004, 0x8004] {
+            let frame = SilexFrame {
+                opcode, seq: 7, is_request: true, sel: Some(0x0281),
+                tag: REQUEST_TAG, maxpacket: 0x80c5, interval: 4,
+                start_frame: 0x12345678, iso_packets: vec![(0, 196)],
+                total_length: 208, data: vec![0; if opcode == 0x8004 { 196 } else { 0 }],
+                ..Default::default()
+            };
+            let legacy = frame.to_bytes();
+            let ds600 = frame.to_ds600_request_bytes();
+            assert_eq!(&legacy[12..16], &0x12345678u32.to_be_bytes());
+            assert_eq!(&ds600[12..16], &[0, 4, 0, 0]);
+            assert_eq!(ds600.len(), legacy.len());
+            assert_eq!(&ds600[16..], &legacy[16..]);
+        }
     }
 
     #[test]

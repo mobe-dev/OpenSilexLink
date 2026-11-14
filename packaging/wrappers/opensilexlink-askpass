@@ -1,0 +1,8 @@
+#!/usr/bin/python3 -I
+"""Password dialog invoked by sudo as the requesting desktop user."""
+import sys
+
+sys.path.insert(0, "/usr/lib/opensilexlink")
+from opensilexlink.gui.privilege import askpass_main
+
+sys.exit(askpass_main())

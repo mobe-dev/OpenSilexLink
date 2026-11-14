@@ -11,16 +11,21 @@ from ..i18n import _
 STATUS_AVAILABLE = "available"
 STATUS_CONNECTED = "connected"
 STATUS_IN_USE = "in_use"
+STATUS_RECONNECTING = "reconnecting"
 
 
 def status_text(device: dict) -> str:
     """Human-readable status text like in SX Virtual Link."""
     st = device.get("status")
+    if st == STATUS_RECONNECTING:
+        return _("Reconnecting…")
     if st == STATUS_CONNECTED:
         return _("Connected by me")
     if st == STATUS_IN_USE:
         who = device.get("owner_host") or device.get("owner_ip") or "?"
         return _("In use by {}").format(who)
+    if device.get("password_required"):
+        return _("USB password required")
     return _("Available")
 
 
@@ -34,11 +39,11 @@ def server_label(server: dict) -> str:
 
 
 def can_connect(device: dict) -> bool:
-    return device.get("status") == STATUS_AVAILABLE
+    return device.get("status") == STATUS_AVAILABLE and not device.get("password_required", False)
 
 
 def can_disconnect(device: dict) -> bool:
-    return device.get("status") == STATUS_CONNECTED
+    return device.get("status") in (STATUS_CONNECTED, STATUS_RECONNECTING)
 
 
 def can_request(device: dict) -> bool:
@@ -272,6 +277,9 @@ class DaemonClient:
         self._cli.connect()
         return self
 
+    def hello(self) -> dict:
+        return self._cli.call("hello", timeout=3.0)
+
     def subscribe(self) -> list[dict]:
         """Subscribe to changes; the initial state arrives as a servers event."""
         self._cli.call("subscribe")
@@ -298,6 +306,9 @@ class DaemonClient:
     def set_device_rule(self, patch: dict) -> dict:
         """patch carries mac, key and the rule fields to set."""
         return self._cli.call("set_device_rule", patch)
+
+    def set_bind_all(self, mac: str, enabled: bool) -> dict:
+        return self._cli.call("set_bind_all", {"mac": mac, "enabled": enabled})
 
     def request_access(self, mac: str, dev_id: str) -> dict:
         """Request a device held by another host from the holding machine."""

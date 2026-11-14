@@ -30,3 +30,11 @@ Thumbs.db
 # --- Local tooling (not part of the project) ---
 .mcp.json
 .claude/
+
+# Private device material (public releases contain application packages only).
+/backups/
+/firmware-local/
+/research/
+*.pcap
+*.pcapng
+*.squashfs

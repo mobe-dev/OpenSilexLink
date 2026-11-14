@@ -28,6 +28,7 @@ pub trait UsbipOps: Send + Sync {
     fn used_ports(&self) -> HashSet<i32>;
     fn attach(&self, busid: &str) -> Result<()>;
     fn detach(&self, port: i32) -> Result<()>;
+    fn ensure_detachable(&self, _port: i32) -> Result<()> { Ok(()) }
 }
 
 pub fn find_helper() -> Option<String> {
@@ -122,6 +123,40 @@ impl UsbipControl {
 }
 
 impl UsbipOps for UsbipControl {
+    fn ensure_detachable(&self, port: i32) -> Result<()> {
+        let root = Path::new("/sys/devices/platform");
+        let mut busid = None;
+        for entry in std::fs::read_dir(root)? {
+            let entry = entry?;
+            if !entry.file_name().to_string_lossy().starts_with("vhci_hcd.") { continue; }
+            if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+                busid = busid.or_else(|| local_busid(&status, port));
+            }
+        }
+        let busid = busid.ok_or_else(|| anyhow::anyhow!("cannot identify USB/IP port {port}; refusing to detach"))?;
+        let usb_path = std::fs::canonicalize(format!("/sys/bus/usb/devices/{busid}"))?;
+        for line in std::fs::read_to_string("/proc/self/mountinfo")?.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields.len() < 5 { continue; }
+            if let Ok(block) = std::fs::canonicalize(format!("/sys/dev/block/{}", fields[2])) {
+                if block.starts_with(&usb_path) {
+                    bail!("Unmount {} before disconnecting this USB device", fields[4]);
+                }
+            }
+        }
+        for line in std::fs::read_to_string("/proc/swaps")?.lines().skip(1) {
+            if let Some(source) = line.split_whitespace().next() {
+                if let Ok(device) = std::fs::canonicalize(source) {
+                    if let Some(name) = device.file_name() {
+                        if let Ok(block) = std::fs::canonicalize(Path::new("/sys/class/block").join(name)) {
+                            if block.starts_with(&usb_path) { bail!("Disable swap on {source} before disconnecting"); }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
     fn ensure_module(&self) -> Result<()> {
         // Only load if not already loaded -> saves a second pkexec prompt.
         if Path::new("/sys/module/vhci_hcd").exists() {
@@ -131,11 +166,19 @@ impl UsbipOps for UsbipControl {
     }
 
     fn used_ports(&self) -> HashSet<i32> {
-        let out = Command::new(resolve("usbip")).arg("port").output();
-        match out {
-            Ok(o) => parse_used_ports(&String::from_utf8_lossy(&o.stdout)),
-            Err(_) => HashSet::new(),
+        // `usbip port` also reads USB device attributes. Those reads can wait
+        // for a reset to finish, which in turn needs this daemon to answer URBs.
+        // The vhci status table contains all occupancy data without device I/O.
+        let mut ports = HashSet::new();
+        if let Ok(entries) = std::fs::read_dir("/sys/devices/platform") {
+            for entry in entries.flatten() {
+                if !entry.file_name().to_string_lossy().starts_with("vhci_hcd.") { continue; }
+                if let Ok(status) = std::fs::read_to_string(entry.path().join("status")) {
+                    ports.extend(parse_vhci_used_ports(&status));
+                }
+            }
         }
+        ports
     }
 
     fn attach(&self, busid: &str) -> Result<()> {
@@ -148,8 +191,18 @@ impl UsbipOps for UsbipControl {
     }
 }
 
+fn local_busid(status: &str, port: i32) -> Option<String> {
+    status.lines().skip(1).find_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() >= 7 && fields[1].parse::<i32>().ok() == Some(port) && fields[6] != "0-0" {
+            Some(fields[6].to_string())
+        } else { None }
+    })
+}
+
 /// Extract busy vhci ports from the output of `usbip port`.
 /// Lines look like: `Port 00: <Port in Use> ...`.
+#[cfg(test)]
 pub fn parse_used_ports(text: &str) -> HashSet<i32> {
     let mut ports = HashSet::new();
     for line in text.lines() {
@@ -168,9 +221,31 @@ pub fn parse_used_ports(text: &str) -> HashSet<i32> {
     ports
 }
 
+fn parse_vhci_used_ports(status: &str) -> HashSet<i32> {
+    status.lines().skip(1).filter_map(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        if fields.len() >= 7 && matches!(fields[2].parse::<u32>(), Ok(5 | 6)) {
+            fields[1].parse().ok()
+        } else { None }
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vhci_status_maps_port_to_local_usb_path() {
+        let status = "hub port sta spd dev sockfd local_busid\nhs 0000 006 002 00010002 000003 2-1\nss 0008 006 005 00010003 000003 3-1\nhs 0001 004 000 00000000 000000 0-0\n";
+        assert_eq!(local_busid(status, 8).as_deref(), Some("3-1"));
+        assert_eq!(local_busid(status, 1), None);
+    }
+
+    #[test]
+    fn vhci_status_includes_importing_ports_and_ignores_free_or_failed_ports() {
+        let status = "hub port sta spd dev sockfd local_busid\nhs 0000 005 002 00010002 000003 0-0\nss 0008 006 005 00010003 000003 3-1\nhs 0001 004 000 00000000 000000 0-0\nhs 0002 007 000 00000000 000000 0-0\n";
+        assert_eq!(parse_vhci_used_ports(status), HashSet::from([0, 8]));
+    }
 
     #[test]
     fn parse_ports() {

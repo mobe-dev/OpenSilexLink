@@ -1,0 +1,16 @@
+[Unit]
+Description=Silex USB devices at %I
+Conflicts=opensilexlink.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/silex-daemon connect %I --all --escalate none
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

@@ -34,9 +34,17 @@ from typing import Any, Callable, Iterator
 # --------------------------------------------------------------------------- #
 #  Addressing
 # --------------------------------------------------------------------------- #
+SYSTEM_SOCKET = "/run/opensilexlink/control.sock"
+
+
 def default_socket_path() -> str:
-    """Default path of the daemon socket (XDG_RUNTIME_DIR, else /tmp)."""
-    base = os.environ.get("XDG_RUNTIME_DIR") or "/tmp"
+    """Prefer the installed system service; keep development sockets private."""
+    override = os.environ.get("SILEX_SOCKET")
+    if override:
+        return override
+    if os.path.exists("/usr/lib/systemd/system/opensilexlink.service") or os.path.exists(SYSTEM_SOCKET):
+        return SYSTEM_SOCKET
+    base = os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/opensilexlink-{os.getuid()}"
     return os.path.join(base, "silex-daemon.sock")
 
 
@@ -120,6 +128,10 @@ class IpcConnection:
             yield from self._decoder.feed(chunk)
 
     def close(self) -> None:
+        try:
+            self._sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             self._sock.close()
         except OSError:

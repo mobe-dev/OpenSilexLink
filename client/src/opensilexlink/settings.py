@@ -77,6 +77,7 @@ class Settings:
     filter_servers: list[str] = field(default_factory=list)   # allowed servers (MAC)
     # -- Per-device rules (auto-connect etc.) ------------------------------ #
     device_rules: list[DeviceRule] = field(default_factory=list)
+    bind_all_servers: list[str] = field(default_factory=list)
 
     RANGE_REFRESH = (3, 60)
 
@@ -114,6 +115,8 @@ class Settings:
         return None
 
     def should_auto_connect(self, server_mac: str, key: str) -> bool:
+        if server_mac in self.bind_all_servers:
+            return True
         rule = self.rule_for(server_mac, key)
         if rule is not None:
             return rule.auto_connect
