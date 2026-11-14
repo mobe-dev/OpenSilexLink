@@ -35,6 +35,26 @@ pub fn ret_for(cmd: &UsbipCmdSubmit) -> UsbipRetSubmit {
     }
 }
 
+/// The Silex has already configured the physical device. Reapplying that same
+/// configuration during vhci enumeration can reset Android's webcam gadget and
+/// destroy every tunnel. Acknowledge only a configuration verified with
+/// GET_CONFIGURATION. A request for another configuration invalidates the cache
+/// and follows the normal transfer path, including any subsequent requests.
+pub fn preserve_active_configuration(cmd: &UsbipCmdSubmit, active: &mut Option<u8>) -> Option<UsbipRetSubmit> {
+    if cmd.ep != 0 || cmd.is_in() || cmd.is_iso() || cmd.transfer_buffer_length != 0
+        || cmd.setup[..2] != [0, 9] || cmd.setup[4..] != [0, 0, 0, 0] {
+        return None;
+    }
+    let requested = u16::from_le_bytes([cmd.setup[2], cmd.setup[3]]);
+    if let Some(current) = *active {
+        if current != 0 && requested == u16::from(current) {
+            return Some(ret_for(cmd));
+        }
+        *active = None;
+    }
+    None
+}
+
 /// Run a CMD_SUBMIT over the session and build the RET_SUBMIT.
 ///
 /// A read timeout fails only this URB (ETIMEDOUT); any other tunnel error is returned
@@ -285,6 +305,40 @@ mod tests {
             transfer_buffer: buffer,
             iso_packets: packets.to_vec(),
         }
+    }
+
+    #[test]
+    fn repeated_configuration_is_local_but_real_changes_and_other_controls_are_forwarded() {
+        let mut cmd = iso_cmd(false, &[], Vec::new());
+        cmd.ep = 0;
+        cmd.setup = [0, 9, 1, 0, 0, 0, 0, 0];
+        let mut active = Some(1);
+        let reply = preserve_active_configuration(&cmd, &mut active).unwrap();
+        assert_eq!(reply.status, 0);
+        assert_eq!(reply.actual_length, 0);
+        assert_eq!(reply.seqnum, cmd.seqnum);
+        assert_eq!(active, Some(1));
+        for (ep, direction, setup) in [
+            (1, 0, [0, 9, 1, 0, 0, 0, 0, 0]),
+            (0, 1, [0, 9, 1, 0, 0, 0, 0, 0]),
+            (0, 0, [0x21, 9, 1, 0, 0, 0, 0, 0]),
+            (0, 0, [0, 9, 1, 0, 1, 0, 0, 0]),
+            (0, 0, [0, 11, 1, 0, 0, 0, 0, 0]),
+        ] {
+            let mut other = cmd.clone();
+            other.ep = ep;
+            other.direction = direction;
+            other.setup = setup;
+            assert!(preserve_active_configuration(&other, &mut active).is_none());
+            assert_eq!(active, Some(1));
+        }
+        assert!(preserve_active_configuration(&cmd, &mut None).is_none());
+        assert!(preserve_active_configuration(&cmd, &mut Some(0)).is_none());
+        cmd.setup[2] = 2;
+        assert!(preserve_active_configuration(&cmd, &mut active).is_none());
+        assert_eq!(active, None);
+        cmd.setup[2] = 1;
+        assert!(preserve_active_configuration(&cmd, &mut active).is_none());
     }
 
     #[test]

@@ -57,6 +57,75 @@ def test_protected_usb_port_explains_why_connect_is_disabled(window):
     assert "password required" in window.details.text()
 
 
+def test_saved_physical_port_password_enables_connection(window):
+    servers = devices()
+    servers[0]["devices"][1].update(password_required=True, password_configured=True, usb_port="usb3")
+    window._render(servers)
+    window._select_device_in_tree("00:11:22:33:44:55", "usb1-002:0")
+    assert window.btn_passwords.isEnabled()
+    assert window.btn_connect.isEnabled()
+    assert "USB 3.0 port" in window.details.text()
+    assert "saved" in window.details.text()
+    window._on_daemon_lost()
+    assert not window.btn_passwords.isEnabled()
+
+
+def test_physical_port_password_dialog_keeps_and_forgets_independently(window, monkeypatch):
+    from PySide6.QtWidgets import QLineEdit
+    from opensilexlink.gui.options import UsbPortPasswordsDialog
+    dialog = UsbPortPasswordsDialog({"usb_port_passwords": {"usb3": True, "usb2": False}}, window)
+    assert set(dialog.password_fields) == {"usb3", "usb2"}
+    assert all(edit.echoMode() == QLineEdit.Password for edit in dialog.password_fields.values())
+    assert dialog.result_passwords() == {}
+    dialog.password_fields["usb2"].setText(" second port ")
+    assert dialog.result_passwords() == {"usb2": " second port "}
+    dialog.forget_fields["usb3"].setChecked(True)
+    assert dialog.result_passwords() == {"usb2": " second port ", "usb3": ""}
+    assert not dialog.password_fields["usb3"].isEnabled()
+    warnings = []
+    monkeypatch.setattr("opensilexlink.gui.options.QMessageBox.warning", lambda *args: warnings.append(args))
+    dialog.password_fields["usb2"].setText("é" * 9)
+    dialog.accept()
+    assert warnings and dialog.result() == 0
+    dialog.password_fields["usb2"].setText("é" * 8)
+    dialog.accept()
+    assert dialog.result() == 1
+    dialog.close()
+
+
+def test_main_window_saves_both_physical_passwords_through_service(window, monkeypatch):
+    import time
+    from opensilexlink.gui.options import UsbPortPasswordsDialog
+    servers = devices()
+    servers[0]["devices"][1].update(password_required=True, usb_port="usb2")
+    saved = []
+    class Client:
+        def set_port_passwords(self, mac, passwords):
+            saved.append((mac, passwords.copy()))
+            servers[0]["usb_port_passwords"] = {"usb3": True, "usb2": True}
+            servers[0]["devices"][1]["password_configured"] = True
+            window._bridge.servers.emit(servers)
+    def fill_and_save(dialog):
+        dialog.password_fields["usb3"].setText("dock-secret")
+        dialog.password_fields["usb2"].setText("other-secret")
+        return 1
+    monkeypatch.setattr(UsbPortPasswordsDialog, "exec", fill_and_save)
+    window.client = Client()
+    window._render(servers)
+    window._select_device_in_tree("00:11:22:33:44:55", "usb1-002:0")
+    assert not window.btn_connect.isEnabled()
+    window.btn_passwords.click()
+    deadline = time.monotonic() + 2
+    while window._policy_pending and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.005)
+    assert not window._policy_pending
+    assert saved == [("00:11:22:33:44:55", {"usb3": "dock-secret", "usb2": "other-secret"})]
+    assert window.btn_connect.isEnabled()
+    assert "dock-secret" not in window.details.text()
+    window.client = None
+
+
 def test_lost_service_disables_controls_and_empty_list_explains_next_step(window, monkeypatch):
     window._render(devices())
     window._select_device_in_tree("00:11:22:33:44:55", "usb5-002:0")

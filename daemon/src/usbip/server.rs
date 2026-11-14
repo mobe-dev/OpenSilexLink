@@ -28,7 +28,7 @@ use super::proto::{self as up, OpHeader, UsbDevice, UsbInterface, UsbipCmdSubmit
 use super::session::SilexSession;
 use super::translate::{
     build_request, fill_ret_from_response, iso_fill_ret, iso_fill_ret_out, iso_out_request_params,
-    iso_request_params, ret_for, submit_to_silex,
+    iso_request_params, preserve_active_configuration, ret_for, submit_to_silex,
 };
 
 const EPIPE: i32 = -32;
@@ -56,7 +56,9 @@ pub struct UsbipServer {
     active: Arc<Mutex<Vec<Arc<SilexDevice>>>>,
     listener: Mutex<Option<TcpListener>>,
     usb_password: Option<Vec<u8>>,
+    device_passwords: StdMutex<HashMap<String, Vec<u8>>>,
     device_speeds: StdMutex<HashMap<String, u32>>,
+    device_ids: StdMutex<HashMap<String, (u16, u16)>>,
 }
 
 impl UsbipServer {
@@ -89,13 +91,24 @@ impl UsbipServer {
             active: Arc::new(Mutex::new(Vec::new())),
             listener: Mutex::new(None),
             usb_password: None,
+            device_passwords: StdMutex::new(HashMap::new()),
             device_speeds: StdMutex::new(HashMap::new()),
+            device_ids: StdMutex::new(HashMap::new()),
         }
     }
 
     pub fn with_usb_password(mut self, password: Option<Vec<u8>>) -> Self {
         self.usb_password = password;
         self
+    }
+
+    pub fn update_passwords(&self, passwords: HashMap<String, Vec<u8>>) {
+        *self.device_passwords.lock().unwrap() = passwords;
+    }
+
+    fn password_for(&self, dev_id: &str) -> Option<Vec<u8>> {
+        self.device_passwords.lock().unwrap().get(dev_id).cloned()
+            .or_else(|| self.usb_password.clone())
     }
 
     pub fn with_device_speeds(self, devices: &[crate::protocol::udp_discovery::UsbDeviceEntry]) -> Self {
@@ -105,8 +118,11 @@ impl UsbipServer {
 
     fn update_speeds(&self, devices: &[crate::protocol::udp_discovery::UsbDeviceEntry]) {
         let mut speeds = self.device_speeds.lock().unwrap();
+        let mut ids = self.device_ids.lock().unwrap();
         speeds.clear();
+        ids.clear();
         for device in devices {
+            ids.insert(device.dev_id.clone(), (device.id_vendor, device.id_product));
             let speed = match device.tag.as_bytes().first() {
                 Some(b'L') => 1,
                 Some(b'F') => 2,
@@ -143,7 +159,7 @@ impl UsbipServer {
             self.host_ip.clone(),
             self.device_port,
             KEEPALIVE,
-        ).with_usb_password(self.usb_password.clone()))
+        ).with_usb_password(self.password_for(dev_id)))
     }
 
     /// A sub-interface session of a composite device: same sel index as the primary.
@@ -156,7 +172,7 @@ impl UsbipServer {
             self.device_port,
             KEEPALIVE,
             Some(dev_index),
-        ).with_usb_password(self.usb_password.clone()))
+        ).with_usb_password(self.password_for(dev_id)))
     }
 
     fn slot(&self, busid: &str) -> Option<DeviceSlot> {
@@ -212,6 +228,13 @@ impl UsbipServer {
         if desc.len() < 18 {
             bail!("short device descriptor");
         }
+        let actual_id = (u16::from_le_bytes([desc[8], desc[9]]), u16::from_le_bytes([desc[10], desc[11]]));
+        if let Some(expected_id) = self.device_ids.lock().unwrap().get(&slot.dev_id).copied() {
+            if actual_id != expected_id {
+                bail!("USB identity mismatch for {}: expected {:04x}:{:04x}, received {:04x}:{:04x}; refusing to attach a different device",
+                    slot.dev_id, expected_id.0, expected_id.1, actual_id.0, actual_id.1);
+            }
+        }
         let cfg = sess.control_in(0x80, 0x06, 0x0200, 0x0000, 9).await.map_err(|e| anyhow::anyhow!("{e}"))?;
         let bcd_usb = u16::from_le_bytes([desc[2], desc[3]]);
         Ok(UsbDevice {
@@ -244,10 +267,16 @@ impl UsbipServer {
     /// sub-interface). A simple device yields a single-session router.
     async fn build_device(self: &Arc<Self>, primary: Arc<SilexSession>, slot: &DeviceSlot) -> Result<SilexDevice> {
         let full_cfg = primary.get_config_descriptor().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+        let active_configuration = match primary.control(0x80, 8, 0, 0, 1, Vec::new()).await {
+            Ok((0, data)) if data.len() == 1 => Some(data[0]),
+            Ok(_) => None,
+            Err(error) => return Err(anyhow::anyhow!("reading active USB configuration: {error}")),
+        };
         let me = self.clone();
         let dev_index = primary.dev_index;
         let make_sub = move |did: &str| me.make_sub_session(did, dev_index);
-        SilexDevice::build(primary, &full_cfg, &slot.dev_id, make_sub).await
+        Ok(SilexDevice::build(primary, &full_cfg, &slot.dev_id, make_sub).await?
+            .with_active_configuration(active_configuration))
     }
 
     async fn handle_devlist(self: Arc<Self>, mut conn: TcpStream) -> Result<()> {
@@ -470,6 +499,7 @@ async fn reader_loop(
     device: Arc<SilexDevice>,
     senders: Vec<(Arc<SilexSession>, mpsc::Sender<WorkerCommand>)>,
 ) {
+    let mut active_configuration = device.active_configuration();
     loop {
         let mut head = [0u8; UsbipCmdSubmit::HEADER_SIZE];
         tokio::select! {
@@ -511,6 +541,12 @@ async fn reader_loop(
                 if cmd.set_iso_from(&descs).is_err() {
                     break;
                 }
+            }
+            if let Some(ret) = preserve_active_configuration(&cmd, &mut active_configuration) {
+                tracing::debug!(seq = cmd.seqnum, configuration = ?active_configuration,
+                    "Keeping the active physical USB configuration");
+                if !pump.complete(&ret).await { break; }
+                continue;
             }
             let target = device.session_for(&cmd);
             tracing::debug!(seq = cmd.seqnum, ep = cmd.ep, direction = cmd.direction,
@@ -728,7 +764,8 @@ async fn mux_reader(pump: Arc<Pump>, sess: Arc<SilexSession>, inflight: MuxInfli
     while pump.is_alive() {
         let resp = match sess.recv_response().await {
             Ok(r) => r,
-            Err(_) => {
+            Err(error) => {
+                tracing::warn!(device = %sess.dev_id, %error, "Silex response stream failed");
                 pump.close();
                 return;
             }
@@ -748,12 +785,90 @@ async fn mux_reader(pump: Arc<Pump>, sess: Arc<SilexSession>, inflight: MuxInfli
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::udp_discovery as ud;
+
+    #[tokio::test]
+    async fn primary_and_composite_sessions_send_the_password_selected_for_their_physical_port() {
+        let udp = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server = UsbipServer::new("127.0.0.1", [0; 6], Some("127.0.0.1".into()),
+            ("127.0.0.1".into(), 0), udp.local_addr().unwrap().port(), vec![]);
+        server.update_passwords(HashMap::from([
+            ("usb4-007:0".into(), b"dock-secret".to_vec()),
+            ("usb4-007:1".into(), b"dock-secret".to_vec()),
+            ("usb5-003:0".into(), b"dock-secret".to_vec()),
+            ("usb1-002:0".into(), b"other-secret".to_vec()),
+        ]));
+        for (dev_id, sub, secret) in [
+            ("usb4-007:0", false, "dock-secret"),
+            ("usb4-007:1", true, "dock-secret"),
+            ("usb5-003:0", false, "dock-secret"),
+            ("usb1-002:0", false, "other-secret"),
+        ] {
+            let session = if sub { server.make_sub_session(dev_id, 7) } else { server.make_session(dev_id) };
+            let connect = tokio::spawn(async move { session.connect_with(0, Duration::ZERO).await });
+            let mut buf = [0u8; 1024];
+            let (n, peer) = timeout(Duration::from_secs(2), udp.recv_from(&mut buf)).await.unwrap().unwrap();
+            let expected = ud::build_password_connect(&[0; 6], "127.0.0.1", dev_id, secret.as_bytes()).unwrap();
+            assert_eq!(&buf[..n], expected.as_slice());
+            udp.send_to(b"\x00\x01\x00\x00\x00\x00\x00\x05DENY\x00", peer).await.unwrap();
+            timeout(Duration::from_secs(2), udp.recv_from(&mut buf)).await.unwrap().unwrap();
+            udp.send_to(b"\x00\x03\x00\x00\x00\x00\x00\x00", peer).await.unwrap();
+            assert!(connect.await.unwrap().is_err());
+        }
+        server.update_passwords(HashMap::new());
+        assert_eq!(server.password_for("usb4-007:0"), None);
+    }
 
     async fn stream_pair() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
         let (server, _) = listener.accept().await.unwrap();
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn identity_mismatch_is_rejected_before_configuration_is_read() {
+        for actual_id in [(0x18d1u16, 0x4eeeu16), (0x17e9, 0x6015)] {
+            let expected = ud::UsbDeviceEntry::new("usb1-015:0", "webcam", 0x18d1, 0x4eee, "H1");
+            let server = UsbipServer::new("127.0.0.1", [0; 6], None,
+                ("127.0.0.1".into(), 0), 19540, vec![("1-1".into(), expected.dev_id.clone())])
+                .with_device_speeds(&[expected]);
+            let slot = server.slot("1-1").unwrap();
+            let session = server.make_session(&slot.dev_id);
+            let (tunnel, mut hardware) = stream_pair().await;
+            session.use_test_stream(tunnel).await;
+            let matching = actual_id == (0x18d1, 0x4eee);
+            let emulator = tokio::spawn(async move {
+                let mut request = [0; 22];
+                hardware.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request[12..18], &[0x80, 6, 1, 0, 0, 0]);
+                let mut desc = [18, 1, 0, 2, 0xef, 2, 1, 64, 0, 0, 0, 0, 0, 1, 1, 2, 3, 1];
+                desc[8..10].copy_from_slice(&actual_id.0.to_le_bytes());
+                desc[10..12].copy_from_slice(&actual_id.1.to_le_bytes());
+                let mut reply = request[..4].to_vec();
+                reply.extend_from_slice(&[0, 0, 0, 0, 0, 18]);
+                reply.extend_from_slice(&desc);
+                hardware.write_all(&reply).await.unwrap();
+                if matching {
+                    hardware.read_exact(&mut request).await.unwrap();
+                    assert_eq!(&request[12..18], &[0x80, 6, 2, 0, 0, 0]);
+                    let mut reply = request[..4].to_vec();
+                    reply.extend_from_slice(&[0, 0, 0, 0, 0, 9, 9, 2, 9, 0, 3, 1, 0, 0x80, 50]);
+                    hardware.write_all(&reply).await.unwrap();
+                } else {
+                    assert!(timeout(Duration::from_millis(100), hardware.read_exact(&mut request)).await.is_err(),
+                        "a different device must not receive any further requests");
+                }
+            });
+            let result = timeout(Duration::from_secs(2), server.read_device_info(&session, &slot)).await.unwrap();
+            if matching {
+                let info = result.unwrap();
+                assert_eq!((info.id_vendor, info.id_product), actual_id);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("USB identity mismatch"));
+            }
+            emulator.await.unwrap();
+        }
     }
 
     fn bulk_submit(seq: u32, direction: u32, ep: u32) -> Vec<u8> {
@@ -772,6 +887,49 @@ mod tests {
             bytes[offset..offset + 4].copy_from_slice(&value.to_be_bytes());
         }
         bytes
+    }
+
+    #[tokio::test]
+    async fn webcam_enumeration_keeps_configuration_and_forwards_camera_controls() {
+        timeout(Duration::from_secs(2), async {
+            for multiplex in [false, true] {
+                let (tunnel, mut hardware) = stream_pair().await;
+                let session = Arc::new(SilexSession::new("127.0.0.1", [0; 6], "usb1-017:0", None, 19540, Duration::ZERO));
+                session.use_test_stream(tunnel).await;
+                let config = if multiplex { vec![9, 4, 0, 0, 1, 14, 1, 0, 0, 7, 5, 0x83, 3, 16, 0, 8] } else { vec![] };
+                let device = Arc::new(SilexDevice::build(session, &config, "usb1-017:0", |_| panic!("single interface")).await.unwrap()
+                    .with_active_configuration(Some(1)));
+                let (mut client, server) = stream_pair().await;
+                let pump = tokio::spawn(urb_pump(server, device));
+                let mut command = vec![0u8; 48];
+                command[..4].copy_from_slice(&up::USBIP_CMD_SUBMIT.to_be_bytes());
+                command[4..8].copy_from_slice(&1u32.to_be_bytes());
+                command[40..48].copy_from_slice(&[0, 9, 1, 0, 0, 0, 0, 0]);
+                client.write_all(&command).await.unwrap();
+                let mut reply = [0; 48];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply[..4], &up::USBIP_RET_SUBMIT.to_be_bytes());
+                assert_eq!(&reply[20..28], &[0; 8]);
+                command[4..8].copy_from_slice(&2u32.to_be_bytes());
+                command[12..16].copy_from_slice(&up::USBIP_DIR_IN.to_be_bytes());
+                command[24..28].copy_from_slice(&1u32.to_be_bytes());
+                command[40..48].copy_from_slice(&[0xa1, 0x86, 0, 2, 0, 2, 1, 0]);
+                client.write_all(&command).await.unwrap();
+                let mut request = [0; 22];
+                hardware.read_exact(&mut request).await.unwrap();
+                // This must be the FIRST tunnel request: no SET_CONFIGURATION.
+                assert_eq!(&request[12..18], &[0xa1, 0x86, 2, 0, 2, 0]);
+                let mut response = request[..4].to_vec();
+                response.extend_from_slice(&[0, 0, 0, 0, 0, 1, 3]);
+                hardware.write_all(&response).await.unwrap();
+                client.read_exact(&mut reply).await.unwrap();
+                let mut value = [0];
+                client.read_exact(&mut value).await.unwrap();
+                assert_eq!(value, [3]);
+                drop(client);
+                pump.await.unwrap().unwrap();
+            }
+        }).await.expect("webcam enumeration stalled");
     }
 
     #[tokio::test]

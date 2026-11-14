@@ -94,6 +94,7 @@ pub fn sub_dev_id(primary_dev_id: &str, iface: u8) -> String {
 /// like a single [`SilexSession`].
 pub struct SilexDevice {
     pub primary: Arc<SilexSession>,
+    active_configuration: Option<u8>,
     endpoints: HashMap<u8, (u8, u8)>, // addr -> (iface, ep_type)
     iface_sessions: HashMap<u8, Arc<SilexSession>>,
     ep_params: HashMap<u8, (u16, u16)>, // addr -> (wMaxPacketSize, bInterval)
@@ -150,7 +151,16 @@ impl SilexDevice {
                 all.push(s.clone());
             }
         }
-        Ok(SilexDevice { primary, endpoints, iface_sessions, ep_params, all })
+        Ok(SilexDevice { primary, active_configuration: None, endpoints, iface_sessions, ep_params, all })
+    }
+
+    pub fn with_active_configuration(mut self, configuration: Option<u8>) -> Self {
+        self.active_configuration = configuration;
+        self
+    }
+
+    pub fn active_configuration(&self) -> Option<u8> {
+        self.active_configuration
     }
 
     /// Single-session device (no config descriptor scan). The whole URB stream runs on the
@@ -162,6 +172,7 @@ impl SilexDevice {
         SilexDevice {
             all: vec![primary.clone()],
             primary,
+            active_configuration: None,
             endpoints: HashMap::new(),
             iface_sessions,
             ep_params: HashMap::new(),
@@ -275,6 +286,7 @@ mod tests {
         SilexDevice {
             all: vec![primary.clone(), s1, s2],
             primary,
+            active_configuration: None,
             endpoints,
             iface_sessions,
             ep_params,

@@ -154,6 +154,85 @@ async fn snapshot_lists_devices_available() {
     assert_eq!(srv["devices"][1]["type"], "Mass storage device");
 }
 
+fn password_server() -> DeviceServer {
+    let mut srv = server();
+    srv.model = "DS-600".into();
+    srv.devices = [("usb4-007:0", "F414221M0"), ("usb5-003:0", "S512M0"), ("usb1-002:0", "F111M0")]
+        .into_iter().enumerate().map(|(i, (id, tag))| {
+            let mut d = UsbDeviceEntry::new(id, "protected", 1, i as u16, tag);
+            d.status_flags = 0x10;
+            d
+        }).collect();
+    srv
+}
+
+#[tokio::test]
+async fn physical_port_passwords_enable_only_matching_devices_without_exposing_secrets() {
+    let (d, _, _) = make();
+    d.apply_server(password_server(), true);
+    assert!(d.connect(MAC_STR, "usb4-007:0").await.unwrap_err().to_string().contains("password required"));
+    let status = d.set_port_passwords(MAC_STR, json!({"usb3":"private-three"}).as_object().unwrap()).await.unwrap();
+    assert_eq!(status, json!({"usb2":false,"usb3":true}));
+    let snap = d.servers_snapshot();
+    let devices = snap["servers"][0]["devices"].as_array().unwrap();
+    assert!(devices.iter().filter(|dev| dev["usb_port"] == "usb3").all(|dev| dev["password_configured"] == true));
+    assert!(devices.iter().filter(|dev| dev["usb_port"] == "usb2").all(|dev| dev["password_configured"] == false));
+    assert!(!snap.to_string().contains("private-three"));
+    assert!(!d.store.get().to_value().to_string().contains("private-three"));
+    let passwords = d.export_passwords(&password_server());
+    assert_eq!(passwords.get("usb4-007:0"), Some(&b"private-three".to_vec()));
+    assert_eq!(passwords.get("usb5-003:0"), Some(&b"private-three".to_vec()));
+    assert!(!passwords.contains_key("usb1-002:0"));
+    d.connect(MAC_STR, "usb4-007:0").await.unwrap();
+    assert!(d.connect(MAC_STR, "usb1-002:0").await.is_err());
+    d.shutdown().await;
+}
+
+#[tokio::test]
+async fn bind_all_uses_saved_physical_port_secrets_after_service_restart() {
+    let (d, _, _) = make();
+    let srv = password_server();
+    d.apply_server(srv.clone(), true);
+    d.set_port_passwords(MAC_STR, json!({"usb3":"private-three"}).as_object().unwrap()).await.unwrap();
+    d.set_bind_all(MAC_STR, true).await.unwrap();
+    wait_for_connections(&d, 2).await;
+    d.set_port_passwords(MAC_STR, json!({"usb2":"private-two"}).as_object().unwrap()).await.unwrap();
+    wait_for_connections(&d, 3).await;
+    d.shutdown().await;
+    let restarted = Daemon::new(d.store.clone(), Arc::new(FakeUsbip::default()), false);
+    restarted.apply_server(srv, true);
+    restarted.maybe_autoconnect();
+    wait_for_connections(&restarted, 3).await;
+    assert_eq!(restarted.credentials.password(MAC_STR, "usb2"), Some(b"private-two".to_vec()));
+    restarted.disconnect(MAC_STR, "usb1-002:0").await.unwrap();
+    restarted.maybe_autoconnect();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!restarted.connections.lock().unwrap().contains_key(&(MAC_STR.into(), "usb1-002:0".into())));
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn protected_device_recovers_with_its_physical_port_password_after_renumbering() {
+    let (d, fake, _) = make();
+    let mut srv = password_server();
+    d.apply_server(srv.clone(), true);
+    d.set_port_passwords(MAC_STR, json!({"usb3":"dock-secret"}).as_object().unwrap()).await.unwrap();
+    d.connect(MAC_STR, "usb4-007:0").await.unwrap();
+    let port = d.connections.lock().unwrap()[&(MAC_STR.into(), "usb4-007:0".into())].port.unwrap();
+    fake.detach(port).unwrap();
+    d.check_connections();
+    srv.devices[0].dev_id = "usb4-012:0".into();
+    d.apply_server(srv.clone(), true);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if d.connections.lock().unwrap().contains_key(&(MAC_STR.into(), "usb4-012:0".into())) { break; }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    assert_eq!(d.export_passwords(&srv).get("usb4-012:0"), Some(&b"dock-secret".to_vec()));
+    d.shutdown().await;
+}
+
 #[tokio::test]
 async fn connect_attaches_and_marks_connected() {
     let (d, fake, _p) = make();

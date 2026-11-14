@@ -15,6 +15,7 @@ use serde_json::{json, Map, Value};
 use tokio::task::JoinHandle;
 
 use crate::discovery::{local_ip_towards, DeviceServer, DiscoveryListener};
+use crate::credentials::CredentialsStore;
 use crate::ipc::{Handler, IpcAddr, IpcServer, Peer};
 use crate::protocol::peer::{self as peerproto, PeerEndpoint, PeerMessage, PeerSender};
 use crate::protocol::udp_discovery as ud;
@@ -69,6 +70,7 @@ struct GraceTimer {
 }
 
 pub struct Daemon {
+    credentials: CredentialsStore,
     store: Arc<SettingsStore>,
     usbip: Arc<dyn UsbipOps>,
     start_usbip_server: bool,
@@ -123,6 +125,7 @@ fn mac_array(mac: &[u8]) -> Result<[u8; 6]> {
 impl Daemon {
     pub fn new(store: Arc<SettingsStore>, usbip: Arc<dyn UsbipOps>, start_usbip_server: bool) -> Arc<Self> {
         Arc::new(Self {
+            credentials: CredentialsStore::new(store.credentials_path()),
             store,
             usbip,
             start_usbip_server,
@@ -486,6 +489,8 @@ impl Daemon {
             "usb_class": d.representative_class(),
             "composite": d.is_composite(),
             "password_required": d.primary().password_required(),
+            "usb_port": srv.usb_port(d.primary()),
+            "password_configured": self.device_password(srv, d.primary()).is_some(),
             "auto_connect": settings.should_auto_connect(&srv.mac_str(), &key),
             "reconnect_on_error": rule.map(|r| r.reconnect_on_error).unwrap_or(true),
             "key": key,
@@ -517,6 +522,7 @@ impl Daemon {
             "version": srv.version,
             "hostname": srv.hostname,
             "bind_all": self.store.get().bind_all_servers.contains(&srv.mac_str()),
+            "usb_port_passwords": self.credentials.status(&srv.mac_str()),
             "ipv6": ipv6,
             "devices": devices,
         })
@@ -587,6 +593,11 @@ impl Daemon {
                 Ok(self.servers_snapshot())
             }
             "get_settings" => Ok(self.store.get().to_value()),
+            "set_port_passwords" => {
+                let passwords = params.get("passwords").and_then(Value::as_object)
+                    .ok_or_else(|| anyhow::anyhow!("missing password updates"))?;
+                self.set_port_passwords(&sp("mac")?, passwords).await
+            }
             "set_settings" => {
                 let s = self.store.update(params.clone())?;
                 self.broadcast("settings", s.to_value());
@@ -661,7 +672,7 @@ impl Daemon {
                 if !matches!(d.interface_index(), None | Some(0)) {
                     continue;
                 }
-                if !d.owner_ip.is_empty() || d.password_required() {
+                if !d.owner_ip.is_empty() || (d.password_required() && self.device_password(&srv, d).is_none()) {
                     continue;
                 }
                 let key = (mac.clone(), d.dev_id.clone());
@@ -694,6 +705,30 @@ impl Daemon {
     }
 
     // -- connect / disconnect ---------------------------------------------- //
+    fn device_password(&self, srv: &DeviceServer, device: &ud::UsbDeviceEntry) -> Option<Vec<u8>> {
+        self.credentials.password(&srv.mac_str(), srv.usb_port(device)?)
+    }
+
+    fn export_passwords(&self, srv: &DeviceServer) -> HashMap<String, Vec<u8>> {
+        srv.devices.iter().filter(|d| d.password_required()).filter_map(|d|
+            self.device_password(srv, d).map(|password| (d.dev_id.clone(), password))).collect()
+    }
+
+    async fn set_port_passwords(self: &Arc<Self>, mac: &str, updates: &Map<String, Value>) -> Result<Value> {
+        let _guard = self.connect_lock.lock().await;
+        let srv = self.find_server_by_mac(mac).ok_or_else(|| anyhow::anyhow!("device server not found"))?;
+        if !srv.model.eq_ignore_ascii_case("DS-600") { bail!("USB port passwords currently require a DS-600"); }
+        self.credentials.update(&srv.mac_str(), updates)?;
+        if self.export_mac.lock().unwrap().as_deref() == Some(mac) {
+            if let Some(server) = self.usbip_server.lock().unwrap().clone() {
+                server.update_passwords(self.export_passwords(&srv));
+            }
+        }
+        self.broadcast_servers();
+        self.maybe_autoconnect();
+        Ok(self.credentials.status(&srv.mac_str()))
+    }
+
     async fn ensure_export(self: &Arc<Self>, srv: &DeviceServer) -> Result<()> {
         self.clear_idle_export().await;
         if let Some(mac) = self.export_mac.lock().unwrap().as_ref() {
@@ -719,6 +754,7 @@ impl Daemon {
         let existing = self.usbip_server.lock().unwrap().clone();
         if let Some(server) = existing {
             server.update_devices(devices.clone(), &srv.devices);
+            server.update_passwords(self.export_passwords(srv));
         }
         if self.start_usbip_server && self.usbip_server.lock().unwrap().is_none() {
             let server = Arc::new(UsbipServer::new(
@@ -729,6 +765,7 @@ impl Daemon {
                 ud::PORT,
                 devices,
             ).with_device_speeds(&srv.devices));
+            server.update_passwords(self.export_passwords(srv));
             server.bind().await?;
             let s = server.clone();
             let task = tokio::spawn(async move {
@@ -760,8 +797,8 @@ impl Daemon {
         if let Some(c) = self.connections.lock().unwrap().get(&key) {
             return Ok(json!({"connected": true, "busid": c.busid, "port": c.port}));
         }
-        if device.primary().password_required() {
-            bail!("USB port password protection is enabled. Configure this test port without a connection password, or use connect --password-file for a headless connection.");
+        if device.primary().password_required() && self.device_password(&srv, device.primary()).is_none() {
+            bail!("USB port password required. Select this DS-600 and open USB port passwords to save the password for its physical port.");
         }
         self.ensure_export(&srv).await?;
         let busid = self
@@ -781,7 +818,12 @@ impl Daemon {
             let before = usbip.used_ports();
             usbip.attach(&attach_busid)?;
             Ok(before)
-        }).await??;
+        }).await?.map_err(|error| {
+            if device.primary().password_required() {
+                anyhow::anyhow!("Connection failed. Check the saved password for the {} physical port in USB port passwords. {error}",
+                    if srv.usb_port(device.primary()) == Some("usb3") { "USB 3.0" } else { "USB 2.0" })
+            } else { error }
+        })?;
         // The new vhci port may appear in `usbip port` shortly after attach.
         let mut port = None;
         for _ in 0..20 {

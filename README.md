@@ -19,7 +19,7 @@ The paths below assume a local build; for a downloaded package, pass its actual
 location to your package manager.
 
 ```sh
-sudo apt install ./dist/release/opensilexlink_1.1.0_amd64.deb
+sudo apt install ./dist/release/opensilexlink_1.1.1_amd64.deb
 sudo usermod -aG opensilexlink "$USER"
 # Log out and back in, or activate the group for this launch:
 sg opensilexlink -c osl-gui
@@ -35,6 +35,9 @@ The UI shows live connection status, server settings, per-device properties,
 a system tray and per-device reconnect controls. **Connect all USB devices on
 this server** binds all available devices and newly discovered devices on a
 selected server, including docking stations. **Reconnect after restart**
+uses saved physical-port passwords when needed: select the DS-600 and choose
+**USB port passwords…** to enter separate USB 3.0 and USB 2.0 passwords.
+All devices behind a dock share its physical connector's password. Startup recovery
 works through the system service before login. **Reconnect after an unexpected
 disconnect** keeps retrying through outages; deliberate Disconnect cancels it. Devices remain connected when the
 window closes. All windows share the managed `opensilexlink.service`.
@@ -86,7 +89,7 @@ Requires Rust/Cargo 1.93.1, Python 3 with pytest/PySide6, and nfpm 2.45.0 for pa
 ```sh
 cargo test --locked --manifest-path daemon/Cargo.toml
 QT_QPA_PLATFORM=offscreen python3 -m pytest -q client/tests
-packaging/build-packages.sh 1.1.0 dist/release
+packaging/build-packages.sh 1.1.1 dist/release
 ```
 
 The build produces `.deb`, `.rpm`, and `SHA256SUMS` in `dist/release/`. Installation is tested on the Ubuntu target host and in Debian 13 / Fedora 45

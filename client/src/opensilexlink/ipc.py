@@ -189,13 +189,21 @@ class IpcClient:
 
     def call(self, method: str, params: dict | None = None, timeout: float = 10.0) -> Any:
         """Send a request and wait for the result (raises on error)."""
-        assert self._conn is not None, "not connected"
+        conn = self._conn
+        if conn is None:
+            raise ConnectionError("not connected to the daemon")
         with self._lock:
             mid = self._next_id
             self._next_id += 1
             ev = threading.Event()
             self._pending[mid] = ev
-        self._conn.send(make_request(mid, method, params))
+        try:
+            conn.send(make_request(mid, method, params))
+        except OSError:
+            with self._lock:
+                self._pending.pop(mid, None)
+                self._results.pop(mid, None)
+            raise
         if not ev.wait(timeout):
             with self._lock:
                 self._pending.pop(mid, None)
@@ -210,8 +218,10 @@ class IpcClient:
         return msg.get("result")
 
     def notify(self, method: str, params: dict | None = None) -> None:
-        assert self._conn is not None
-        self._conn.send(make_request(None, method, params))
+        conn = self._conn
+        if conn is None:
+            raise ConnectionError("not connected to the daemon")
+        conn.send(make_request(None, method, params))
 
     def close(self) -> None:
         if self._conn:

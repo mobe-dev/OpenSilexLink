@@ -11,7 +11,7 @@ or install the Python client separately in a virtual environment.
 ## Install
 
 ```sh
-sudo apt install ./dist/release/opensilexlink_1.1.0_amd64.deb
+sudo apt install ./dist/release/opensilexlink_1.1.1_amd64.deb
 sudo usermod -aG opensilexlink "$USER"
 # Log out and back in to activate the new group, then:
 osl-gui
@@ -50,8 +50,8 @@ Select a server or any of its devices and enable **Connect all USB devices on
 this server** to bind every available device, including devices behind docking
 station hubs. This policy is saved by server MAC address, works before login
 and includes devices added later. Composite interfaces are attached together
-as one physical device. Busy devices owned by another computer and USB ports
-requiring passwords are skipped. Each device retains its own unexpected-loss
+as one physical device. Busy devices owned by another computer and protected
+USB ports without a saved password are skipped. Each device retains its own unexpected-loss
 recovery preference. Manual Disconnect stays disconnected until explicit
 Connect, a service restart, or turning connect-all off and on again. Turning
 connect-all off leaves active connections and individual startup rules intact.
@@ -67,7 +67,7 @@ socket at `/run/opensilexlink/control.sock`; closing the window does not detach
 USB devices. The daemon runs as root to load vhci-hcd and attach/detach USB/IP
 ports. The socket is root:opensilexlink, mode 0660, in a mode 0750 directory.
 Membership of this group authorizes management of the shared USB connections.
-No passwords or server addresses are embedded in the package.
+No passwords or preconfigured device connections are embedded in the application.
 
 Bluetooth audio additionally needs the desktop user's PipeWire and WirePlumber
 services. If headphones pair but fail to connect with an A2DP `Protocol not
@@ -187,17 +187,51 @@ sudo systemctl stop opensilexlink.service
 sudo silex-daemon connect 192.168.178.150 --all --escalate none
 ```
 
-A USB port password is separate from the web administrator password. The GUI
-reports protected ports but does not store their passwords. A headless connection
-can use `--password-file /path/to/private-file` (at most 16 bytes, mode 0600).
-Authentication encoding has firmware-derived tests; successful password login on
-physical hardware has not been exercised after the test unit's reset.
+A USB connection password is separate from the web administrator password.
+Select the DS-600 (or any of its devices) and click **USB port passwords…**.
+Enter the existing password for the **USB 3.0 physical port** and/or the
+**USB 2.0 physical port**. This saves client credentials; it does not change the
+passwords configured on the Silex itself. Leave a field blank to retain its saved
+value; use **Forget saved password** to remove it. Passwords are limited to
+16 UTF-8 bytes, with no NUL character.
+
+Every device behind a hub or dock uses the password of the physical connector
+the hub plugs into. On the DS-600, bus 4 (USB 2-speed dock functions) and bus 5
+(SuperSpeed functions) both use the USB 3.0 port password; bus 1 uses the USB 2.0
+port password. Unknown buses/models do not fall back to another port's password.
+
+The service stores credentials separately from general settings in
+`/var/lib/opensilexlink/silex/settings.passwords.json`, mode **0600**, inside the
+service's private state directory. These passwords are plaintext on disk, so
+protect backups accordingly. They are never returned through get-settings or
+server status broadcasts. Saving a password does not disconnect existing devices.
+Manual connection, connect-all, boot-time reconnect and unexpected-loss recovery
+use the matching saved password. Manual Disconnect continues to suppress retries.
+A saved password has not been authenticated until connection succeeds; replace
+it in this dialog if authentication fails. Devices owned by another computer
+remain unavailable until released there.
+
+The standalone foreground helper can still use
+`--password-file /path/to/private-file` (one password for that invocation).
+That helper is separate from the managed service's per-physical-port credentials.
+Authentication encoding and per-port credential routing have automated tests;
+successful password login on physical hardware remains to be confirmed with
+the owner's port passwords.
 
 If the GUI reports Service offline, check the unit and group membership with
 `systemctl status opensilexlink` and `id`. If `vhci-hcd` is missing, install your
 distribution's matching kernel module package. If a drive is absent on the
 DS-600, disable its NAS service in the web interface and restart the DS-600.
 A device held by SX Virtual Link on another computer must be released first.
+
+For a composite webcam or Android phone, release the whole device on the other
+computer, including non-video interfaces, and disable its automatic reconnect
+while testing. Select **Webcam** in the phone's USB preferences; a USB reset may
+return it to its normal phone mode and change its discovery ID. Rediscover it
+before reconnecting. The bridge verifies the USB vendor/product IDs against
+discovery and rejects mismatches before attaching. It also reads the current
+USB configuration and acknowledges duplicate configuration requests locally,
+so Linux enumeration does not reconfigure an already active webcam gadget.
 
 Only one server can have active connections in this release; several USB devices
 on that server are supported. Another server is rejected explicitly. The local
@@ -207,7 +241,7 @@ use a trusted LAN, with firewall isolation from untrusted networks.
 
 ## Release checks
 
-`packaging/build-packages.sh 1.1.0` runs Rust and Python tests, builds a locked
+`packaging/build-packages.sh 1.1.1` runs Rust and Python tests, builds a locked
 release binary, compiles translations, and produces Debian/RPM artifacts plus
 SHA256SUMS. Install cargo, pytest, PySide6 (for GUI tests), and nfpm 2.45.0.
 GUI tests run with Qt's offscreen platform. CI also tests installation in clean

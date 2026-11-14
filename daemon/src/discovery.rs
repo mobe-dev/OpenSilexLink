@@ -86,6 +86,18 @@ pub struct DeviceServer {
 }
 
 impl DeviceServer {
+    /// Physical connector, not the negotiated USB speed or a downstream hub port.
+    /// DS-600 firmware S90svu assigns buses 4/5 to USB 3.0 and bus 1 to USB 2.0.
+    pub fn usb_port(&self, device: &ud::UsbDeviceEntry) -> Option<&'static str> {
+        if !self.model.eq_ignore_ascii_case("DS-600") { return None; }
+        let (bus, _) = device.dev_id.strip_prefix("usb")?.split_once('-')?;
+        match bus {
+            "4" | "5" => Some("usb3"),
+            "1" => Some("usb2"),
+            _ => None,
+        }
+    }
+
     pub fn new(ip: &str) -> Self {
         Self { ip: ip.to_string(), ..Default::default() }
     }
@@ -242,6 +254,23 @@ impl DiscoveryListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ds600_physical_connector_does_not_depend_on_speed_or_hub_depth() {
+        let srv = DeviceServer { model: "DS-600".into(), ..Default::default() };
+        for (dev_id, tag, port) in [
+            ("usb4-007:0", "F414221M0", Some("usb3")),
+            ("usb4-007:1", "F414221M1", Some("usb3")),
+            ("usb5-003:0", "S512M0", Some("usb3")),
+            ("usb1-002:0", "F111M0", Some("usb2")),
+            ("usb2-002:0", "F211", None),
+            ("dev01", "H111", None),
+        ] {
+            let device = ud::UsbDeviceEntry::new(dev_id, "test", 1, 2, tag);
+            assert_eq!(srv.usb_port(&device), port);
+            assert_eq!(DeviceServer { model: "DS-510".into(), ..Default::default() }.usb_port(&device), None);
+        }
+    }
 
     fn list_fragment(op: u16, more: u16, offset: usize, payload: &[u8]) -> Vec<u8> {
         let mut packet = Vec::new();

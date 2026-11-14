@@ -24,7 +24,7 @@ def status_text(device: dict) -> str:
     if st == STATUS_IN_USE:
         who = device.get("owner_host") or device.get("owner_ip") or "?"
         return _("In use by {}").format(who)
-    if device.get("password_required"):
+    if device.get("password_required") and not device.get("password_configured"):
         return _("USB password required")
     return _("Available")
 
@@ -39,7 +39,8 @@ def server_label(server: dict) -> str:
 
 
 def can_connect(device: dict) -> bool:
-    return device.get("status") == STATUS_AVAILABLE and not device.get("password_required", False)
+    return device.get("status") == STATUS_AVAILABLE and (
+        not device.get("password_required", False) or device.get("password_configured", False))
 
 
 def can_disconnect(device: dict) -> bool:
@@ -309,6 +310,9 @@ class DaemonClient:
 
     def set_bind_all(self, mac: str, enabled: bool) -> dict:
         return self._cli.call("set_bind_all", {"mac": mac, "enabled": enabled})
+
+    def set_port_passwords(self, mac: str, passwords: dict) -> dict:
+        return self._cli.call("set_port_passwords", {"mac": mac, "passwords": passwords})
 
     def request_access(self, mac: str, dev_id: str) -> dict:
         """Request a device held by another host from the holding machine."""

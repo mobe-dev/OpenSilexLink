@@ -10,7 +10,7 @@ Install Rust **1.93.1**, Python with pytest/PySide6, and nfpm **2.45.0**.
 Run:
 
 ```sh
-packaging/build-packages.sh 1.1.0 dist/release
+packaging/build-packages.sh 1.1.1 dist/release
 (cd dist/release && sha256sum -c SHA256SUMS)
 ```
 
@@ -38,14 +38,14 @@ Release workflow only publishes after every install test passes.
 3. Create and push the matching tag:
 
    ```sh
-   git tag -a v1.1.0 -m "OpenSilexLink 1.1.0"
+   git tag -a v1.1.1 -m "OpenSilexLink 1.1.1"
    git push origin main
-   git push origin v1.1.0
+   git push origin v1.1.1
    ```
 
 4. Wait for the Release workflow. It publishes four explicit assets:
-   `opensilexlink_1.1.0_amd64.deb`,
-   `opensilexlink-1.1.0-1.x86_64.rpm`, `THIRD_PARTY_NOTICES.txt`, and `SHA256SUMS`.
+   `opensilexlink_1.1.1_amd64.deb`,
+   `opensilexlink-1.1.1-1.x86_64.rpm`, `THIRD_PARTY_NOTICES.txt`, and `SHA256SUMS`.
    Checksums detect corruption; they are not independent signatures.
 
 Packages are GitHub Release downloads. This project does not operate an APT

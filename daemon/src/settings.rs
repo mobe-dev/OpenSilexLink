@@ -208,6 +208,10 @@ impl SettingsStore {
         self.settings.lock().unwrap().clone()
     }
 
+    pub fn credentials_path(&self) -> PathBuf {
+        self.path.with_extension("passwords.json")
+    }
+
     fn write_atomic(path: &PathBuf, s: &Settings) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;

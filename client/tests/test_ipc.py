@@ -72,6 +72,27 @@ def test_error_response_raises(echo_server):
             cli.call("boom")
 
 
+def test_unconnected_client_reports_connection_error():
+    cli = ipc.IpcClient()
+    with pytest.raises(ConnectionError, match="not connected to the daemon"):
+        cli.call("get_settings")
+    with pytest.raises(ConnectionError, match="not connected to the daemon"):
+        cli.notify("refresh")
+
+
+def test_failed_send_cleans_up_pending_request():
+    class BrokenConnection:
+        def send(self, message):
+            raise BrokenPipeError("daemon disconnected")
+
+    cli = ipc.IpcClient()
+    cli._conn = BrokenConnection()
+    with pytest.raises(BrokenPipeError):
+        cli.call("connect")
+    assert cli._pending == {}
+    assert cli._results == {}
+
+
 def test_broadcast_reaches_subscribers(echo_server):
     events = []
     ev = threading.Event()

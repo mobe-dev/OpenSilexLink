@@ -11,7 +11,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QTabWidget, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QCheckBox, QSpinBox, QLineEdit, QPushButton, QListWidget, QListWidgetItem,
-    QDialogButtonBox, QLabel, QGroupBox, QFileDialog,
+    QDialogButtonBox, QLabel, QGroupBox, QFileDialog, QMessageBox,
 )
 
 from ..i18n import _
@@ -30,6 +30,62 @@ COLUMNS = [
     ("ipv6", "IPv6 address"), ("mac", "Ethernet address"),
 ]
 _COL_LABEL = dict(COLUMNS)
+
+
+class UsbPortPasswordsDialog(QDialog):
+    """Edit secrets without ever reading existing passwords back from the service."""
+
+    def __init__(self, server: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(_("USB port passwords"))
+        self.resize(490, 280)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(server.get("hostname") or server.get("ip") or "DS-600"))
+        hint = QLabel(_("Enter the USB connection password already configured on each physical port. "
+                        "These passwords are separate from the web administrator password. "
+                        "All devices behind a hub or dock share the password of its physical port."))
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        self.password_fields = {}
+        self.forget_fields = {}
+        saved = server.get("usb_port_passwords", {})
+        form = QFormLayout()
+        for port, label in (("usb3", _("USB 3.0 port")), ("usb2", _("USB 2.0 port"))):
+            edit = QLineEdit()
+            edit.setEchoMode(QLineEdit.Password)
+            edit.setPlaceholderText(_("Saved — leave blank to keep") if saved.get(port) else _("No password saved"))
+            forget = QCheckBox(_("Forget saved password"))
+            forget.setEnabled(bool(saved.get(port)))
+            forget.toggled.connect(edit.setDisabled)
+            row = QHBoxLayout()
+            row.addWidget(edit, 1)
+            row.addWidget(forget)
+            form.addRow(label, row)
+            self.password_fields[port] = edit
+            self.forget_fields[port] = forget
+        layout.addLayout(form)
+        storage = QLabel(_("Saved in a private file owned by the background service, so reconnect "
+                           "works before login. Passwords are not encrypted at rest. "
+                           "Maximum 16 UTF-8 bytes per password; leave blank to keep the current value."))
+        storage.setWordWrap(True)
+        layout.addWidget(storage)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def result_passwords(self) -> dict:
+        return {port: "" if self.forget_fields[port].isChecked() else edit.text()
+                for port, edit in self.password_fields.items()
+                if self.forget_fields[port].isChecked() or edit.text()}
+
+    def accept(self) -> None:
+        if any(len(value.encode("utf-8")) > 16 or "\0" in value
+               for value in self.result_passwords().values()):
+            QMessageBox.warning(self, _("USB port passwords"),
+                                _("Each password must contain at most 16 UTF-8 bytes and no NUL characters."))
+            return
+        super().accept()
 
 
 class OptionsDialog(QDialog):

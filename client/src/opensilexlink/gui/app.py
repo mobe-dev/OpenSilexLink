@@ -37,7 +37,7 @@ from .client import (
     resolve_columns, column_labels, device_cell, device_icon_candidates, SERVER_ICON,
     display_name, connected_keys, apps_to_launch,
 )
-from .options import OptionsDialog, DevicePropertiesDialog
+from .options import OptionsDialog, DevicePropertiesDialog, UsbPortPasswordsDialog
 
 _ROLE = Qt.UserRole
 
@@ -156,9 +156,13 @@ class MainWindow(QMainWindow):
         self.btn_web = QPushButton(_("Open server settings"))
         self.btn_web.clicked.connect(self._open_server_web)
         self.btn_web.setEnabled(False)
+        self.btn_passwords = QPushButton(_("USB port passwords…"))
+        self.btn_passwords.clicked.connect(self._edit_port_passwords)
+        self.btn_passwords.setEnabled(False)
 
         buttons = QHBoxLayout()
         buttons.addWidget(self.btn_web)
+        buttons.addWidget(self.btn_passwords)
         buttons.addStretch(1)
         buttons.addWidget(self.btn_connect)
         buttons.addWidget(self.btn_disconnect)
@@ -253,6 +257,36 @@ class MainWindow(QMainWindow):
                 self._bridge.daemon_lost.emit()
             finally:
                 self._health_pending = False
+        threading.Thread(target=work, daemon=True).start()
+
+    def _edit_port_passwords(self) -> None:
+        server, client = self._selected_server(), self.client
+        if (not server or client is None or not self._online or self._policy_pending or
+                server.get("model", "").upper() != "DS-600"):
+            return
+        dialog = UsbPortPasswordsDialog(server, self)
+        if not dialog.exec():
+            for field in dialog.password_fields.values():
+                field.clear()
+            dialog.deleteLater()
+            return
+        updates = dialog.result_passwords()
+        for field in dialog.password_fields.values():
+            field.clear()
+        dialog.deleteLater()
+        if not updates:
+            return
+        mac = server["mac"]
+        self._policy_pending = True
+        self._update_buttons()
+        def work():
+            try:
+                client.set_port_passwords(mac, updates)
+                self._bridge.op_done.emit("policy", True, _("USB port passwords saved in the background service."))
+            except (ipc.IpcError, OSError) as exc:
+                self._bridge.op_done.emit("policy", False, str(exc))
+            finally:
+                updates.clear()
         threading.Thread(target=work, daemon=True).start()
 
     def _save_connection_policy(self, field: str, enabled: bool) -> None:
@@ -672,6 +706,9 @@ class MainWindow(QMainWindow):
         self.btn_disconnect.setEnabled(self._online and not self._operation_pending and bool(dev) and can_disconnect(dev))
         server = self._selected_server()
         self.btn_web.setEnabled(bool(server))
+        self.btn_passwords.setEnabled(self._online and bool(server) and
+                                      server.get("model", "").upper() == "DS-600" and
+                                      not self._policy_pending and not self._operation_pending)
         bind_all = bool(server and server.get("bind_all"))
         self.cb_bind_all.blockSignals(True)
         self.cb_bind_all.setChecked(bind_all)
@@ -685,12 +722,19 @@ class MainWindow(QMainWindow):
             checkbox.setEnabled(self._online and bool(dev) and not self._policy_pending and
                                 (field != "auto_connect" or (self._system_service and not bind_all)))
         if dev:
+            if dev.get("password_required"):
+                port = {"usb3": _("USB 3.0 port"), "usb2": _("USB 2.0 port")}.get(dev.get("usb_port"), "")
+                hint = (_("USB password saved. Connect to authenticate.") if dev.get("password_configured") else
+                        _("USB connection password required. Click USB port passwords to save it."))
+                if port:
+                    hint = port + " · " + hint
+            else:
+                hint = (_("Unmount storage in your file manager before disconnecting.") if dev.get("usb_class") == 8 else
+                        _("Uses this computer’s normal USB driver after connection."))
             self.details.setText(f"{display_name(dev)}  ·  {dev.get('id_vendor', 0):04x}:{dev.get('id_product', 0):04x}  ·  {dev.get('speed', '')}  ·  {server.get('ip', '') if server else ''}\n" +
-                                 (_("USB connection password required. Configure the USB port in server settings.") if dev.get("password_required") else
-                                  _("Unmount storage in your file manager before disconnecting.") if dev.get("usb_class") == 8 else
-                                  _("Uses this computer’s normal USB driver after connection.")))
+                                 hint)
         elif server:
-            self.details.setText(_("Connect all devices on this server, including devices behind a USB docking station. Devices in use by another computer or requiring a USB password are left available for individual connection."))
+            self.details.setText(_("Connect all devices on this server, including devices behind a USB docking station. Save each physical port’s USB password using USB port passwords. Devices in use by another computer or missing a password are skipped."))
         else:
             self.details.setText(_("Select a USB device to see its status and connection controls."))
 
